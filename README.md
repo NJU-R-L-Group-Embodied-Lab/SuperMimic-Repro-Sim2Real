@@ -6,6 +6,8 @@
 
 方法来自论文 [SuperMimic](https://arxiv.org/abs/2610.28480)（Liao 等，CoRL 2026）：它先训练一个神经网络代替物理仿真器，预测机器人下一步怎么动（论文叫"世界模型"）。这个网络能求导，所以可以像训练普通网络一样，直接用反向传播优化控制策略，不用靠强化学习反复试错。
 
+<p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.0/shanshenbu_real_robot_v3.mp4"><img src="docs/assets/shanshenbu_demo.gif" alt="G1 真机跳闪身步：左边是人类原视频，右边是机器人" width="720"></a><br><sub>左：人类原视频；右：G1 真机。点击看带声音的完整视频（约 46 秒）。</sub></p>
+
 实机演示视频和预训练模型在 [GitHub Release](https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases)。
 
 > **安全警告**：真机代码会直接控制 G1 的电机。模型、参数或操作出错，机器人可能摔倒、损坏或伤人。请只在吊架保护下运行，并且始终有人拿着遥控器，随时准备按 L2+B 让机器人进入阻尼（软急停）。上机前完整读一遍 [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md)。本项目按原样提供，使用风险自负。

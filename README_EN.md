@@ -6,6 +6,8 @@ This repository teaches a Unitree G1 humanoid robot to copy human motion. First 
 
 The method comes from the [SuperMimic paper](https://arxiv.org/abs/2610.28480) (Liao et al., CoRL 2026). It first trains a neural network to stand in for the physics simulator and predict how the robot will move (the paper calls it a "world model"). Because this network is differentiable, the controller can then be trained with ordinary backpropagation through it, instead of trial-and-error reinforcement learning.
 
+<p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.0/shanshenbu_real_robot_v3.mp4"><img src="docs/assets/shanshenbu_demo.gif" alt="Real G1 dancing shanshenbu: human source video on the left, robot on the right" width="720"></a><br><sub>Left: human source video. Right: real G1. Click for the full video with sound (~46 s).</sub></p>
+
 The real-robot demo video and pretrained models are on [GitHub Releases](https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases).
 
 > **Safety warning**: the real-robot code drives the G1's motors directly. A wrong model, wrong settings or an operator mistake can make the robot fall, break, or hurt someone. Only run it with the robot on a hoist, and always have one person holding the remote, ready to press L2+B to put the robot into damping mode (a soft emergency stop). Read [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) in full before you start. This project is provided as is. Use it at your own risk.
