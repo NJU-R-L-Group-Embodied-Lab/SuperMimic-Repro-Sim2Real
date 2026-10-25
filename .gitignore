@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+/logs/
+/data/
+wandb/
+*.npz
+*.pt
+*.onnx
+.pytest_cache/
+.ruff_cache/
+experiments/**/outputs/
+
+# Deploy bundles, robot logs, videos (published as release assets, not tracked)
+deploy_artifacts/
+deploy_logs/
+videos*/
+*.mp4
+# macOS metadata
+.DS_Store
+._*

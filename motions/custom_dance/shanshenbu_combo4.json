@@ -1,0 +1,73 @@
+{
+ "fps": 30,
+ "frames": 1373,
+ "source": "combo_c4_full_vc_b15f20 (50 Hz deploy reference) resampled to 30 fps",
+ "segments": [
+  {
+   "name": "stand_idle",
+   "kind": "clip",
+   "start": 0,
+   "end": 30
+  },
+  {
+   "name": "T1: stand_idle -> shanshenbu",
+   "kind": "transition",
+   "start": 30,
+   "end": 74
+  },
+  {
+   "name": "shanshenbu",
+   "kind": "clip",
+   "start": 74,
+   "end": 290
+  },
+  {
+   "name": "T2: shanshenbu -> langzi_tiqiu",
+   "kind": "transition",
+   "start": 290,
+   "end": 334
+  },
+  {
+   "name": "langzi_tiqiu",
+   "kind": "clip",
+   "start": 334,
+   "end": 485
+  },
+  {
+   "name": "T3: langzi_tiqiu -> gouxiong_duosuomao_full_vc",
+   "kind": "transition",
+   "start": 485,
+   "end": 530
+  },
+  {
+   "name": "gouxiong_duosuomao_full_vc",
+   "kind": "clip",
+   "start": 530,
+   "end": 926
+  },
+  {
+   "name": "T4: gouxiong_duosuomao_full_vc -> yaotou_huangnao_full",
+   "kind": "transition",
+   "start": 926,
+   "end": 971
+  },
+  {
+   "name": "yaotou_huangnao_full",
+   "kind": "clip",
+   "start": 971,
+   "end": 1283
+  },
+  {
+   "name": "T5: yaotou_huangnao_full -> stand_idle",
+   "kind": "transition",
+   "start": 1283,
+   "end": 1343
+  },
+  {
+   "name": "stand_idle",
+   "kind": "clip",
+   "start": 1343,
+   "end": 1373
+  }
+ ]
+}

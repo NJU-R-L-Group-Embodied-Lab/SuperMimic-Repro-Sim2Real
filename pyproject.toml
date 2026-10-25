@@ -1,0 +1,67 @@
+[project]
+name = "supermimic"
+version = "0.1.0"
+description = "Reproduction of SuperMimic (arXiv 2610.28480): one differentiable world model + BPTT for humanoid whole-body tracking, on mjlab / MuJoCo Warp"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # Base framework, pinned to the exact commit the plan was written against (main, 2026-10-18).
+  "mjlab",
+  # Declared directly so that our [tool.uv.sources] below apply (mjlab's own sources do not propagate).
+  "torch>=2.14.0",
+  "warp-lang>=1.15.0",
+  "mujoco-warp~=3.16.0",
+  "mujoco~=3.16.0",
+  "numpy",
+  "scipy>=1.15",
+  "tensorboard>=2.20.0",
+  "tyro>=1.0.1",
+  "huggingface-hub>=0.30",
+  "pandas",
+  "pyarrow",
+  "tqdm",
+]
+
+[project.scripts]
+sm-train = "supermimic.scripts.train:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+  "pyright>=1.1.400",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/supermimic"]
+
+[tool.uv.sources]
+mjlab = { git = "https://github.com/mujocolab/mjlab", rev = "8bb2bc9e187797689ec82c78c35019afd2fd0376" }
+torch = { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }
+warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
