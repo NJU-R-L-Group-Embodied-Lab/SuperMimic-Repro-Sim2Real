@@ -35,6 +35,11 @@ class PolicyTrainerCfg:
     obs_noise: bool = True
     compile: str | None = "default"
     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+    # Saturating-IMU observation model in imagination (copied from EnvCfg.imu_* by the training loop; 0 = off).
+    imu_sat_prob: float = 0.0
+    imu_gyro_limit: float = 8.727
+    imu_accel_k_max: float = 0.5
+    imu_init_tilt_deg: float = 8.0
 
 
 class PolicyTrainer:
@@ -65,7 +70,12 @@ class PolicyTrainer:
         # ---- actor: BPTT through the frozen world model ------------------------------------
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs)
+        imu = None
+        if cfg.imu_sat_prob > 0.0:
+            from supermimic.envs.imu_model import ImuImagCfg
+
+            imu = ImuImagCfg(cfg.imu_sat_prob, cfg.imu_gyro_limit, cfg.imu_accel_k_max, cfg.imu_init_tilt_deg)
+        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs, imu=imu)
         feat, goals, e_root = self._critic_inputs(ro)
         if cfg.use_critic:
             v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])

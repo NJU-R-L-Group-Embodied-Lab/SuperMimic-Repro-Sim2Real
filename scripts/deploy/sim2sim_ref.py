@@ -16,6 +16,8 @@ import numpy as np
 import torch
 import tyro
 
+from supermimic.deploy.waist_coupling import env_args as coupling_args, resolve_coupling
+from supermimic.deploy.waist_roll import resolve_range as resolve_waist_roll_range
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.eval.benchmark import load_policy_from_checkpoint
 
@@ -38,10 +40,20 @@ def main(ckpt: Path, out: Path, tf32: bool = True, npz_dir: Path = Path("data/np
     CLIPS = tuple(clips)  # noqa: N806
     files = [str(npz_dir / f"{c}.npz") for c in CLIPS]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
+    # waist coupling (default off): SM_WAIST_COUPLING if set, else as the checkpoint was trained; recorded in the npz
+    # (key absent = uncoupled) so the sim2sim G1 gate can refuse a reference made with other physics.
+    wc = resolve_coupling(cfg["env"])
+    if wc is not None:
+        print(f"  waist coupling ON: (k, c) = {wc}", flush=True)
+    # waist-roll range (default off = MJCF +-0.52): SM_WAIST_ROLL range if set, else as trained; recorded in the npz
+    wr = resolve_waist_roll_range(cfg["env"])
+    if wr is not None:
+        print(f"  waist roll range +-{wr}", flush=True)
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=len(files), future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start",
-        record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
+        record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False), **coupling_args(wc),
+        **({} if wr is None else {"waist_roll_range": wr}),
     )
     env = make_env(args, device=device)
     torch.backends.cuda.matmul.allow_tf32 = tf32
@@ -80,6 +92,10 @@ def main(ckpt: Path, out: Path, tf32: bool = True, npz_dir: Path = Path("data/np
                 break
         rq, gq, acts = torch.stack(rq, 1).numpy(), torch.stack(gq, 1).numpy(), torch.stack(acts, 1).numpy()
         save = {"clips": np.array(CLIPS), "tf32": np.array(tf32), "obs0": obs0, "goal0": goal0, "fail_step": fail_step.cpu().numpy(), "length": length.cpu().numpy()}
+        if wc is not None:
+            save["waist_coupling"] = np.array(wc, dtype=np.float64)
+        if wr is not None:
+            save["waist_roll_range"] = np.array(wr, dtype=np.float64)
         for i, c in enumerate(CLIPS):
             L = int(length[i]) + 1
             save[f"{c}/robot_q"] = rq[i, :L].astype(np.float64)

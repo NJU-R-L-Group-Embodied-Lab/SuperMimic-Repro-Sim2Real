@@ -25,10 +25,22 @@ Gates (round 2: core defaults soft-limit clamp off, torque clamp 1.5 x effort)
       python scripts/deploy/sim2sim.py --cmd standby --ckpt ckpt_0116000 --workers 16
       R1+X is pressed at --standby-pre-s and the motion starts only once the runner's check passes (STANDBY_PRE >= 3 s, last 3 s
       tilt err < 8 deg and max|dq| < 1 rad/s; --standby-r1x-*), re-pressed for up to --standby-r1x-cap-s, else no motion ('never').
+  --waist-coupling  (default off) real-G1 waist roll/pitch coupling |roll| + k |pitch| <= c (k 1.4, c 0.95 fitted on the real
+      logs; supermimic.deploy.waist_coupling) as two limited fixed tendons in every gate model; or export SM_WAIST_COUPLING=k,c.
+  --waist-roll-range R / --waist-roll-damping D / --waist-roll-friction F  (default off; or export
+      SM_WAIST_ROLL="range=0.72,damping=1.8,friction=2") real-G1 waist roll (supermimic.deploy.waist_roll): waist_roll_joint
+      range +-R in every gate model (G1 training MJCF and the Unitree MJCF; the coupling tendons are unchanged); waist-roll
+      dof_damping += D [Nm s/rad] and frictionloss = F [Nm] in the Unitree G2/G3/standby models only (G1 stays a parity check
+      against the training env, whose reference must have the same range: sim2sim_ref.py under the same SM_WAIST_ROLL).
+      Reports get a _wr suffix after _wc (_wc_wr_imu) and record the setting.
   --lock-waist  "G1 29dof with waist locked" (the real robot: motors 13/14 absent, lowstate q = dq = 0): waist_roll/pitch
       joints, actuators and sensors are deleted from BOTH MJCFs (bodies welded at q = 0, as Unitree's
       g1_29dof_lock_waist.xml), q = dq = 0 reported to DeployCore, actions 13/14 computed but never applied.
       Applies to g1/g2/g3 (results -> sim2sim_lw_<ckpt>.json).
+  --imu-model  (default off) real-G1 pelvis IMU (supermimic.deploy.imu_model): gyro clipped at +-500 deg/s per axis, quaternion
+      = gyro-only attitude integrated at the physics rate from the clipped gyro (no accelerometer correction); applied to
+      G1/G2/G3/standby; or export SM_IMU_MODEL=1. Reports get an _imu suffix (after _wc: _wc_imu), JSON records imu_model true,
+      rows get imu_sat_z_frames / imu_grav_err_max_deg (+ _frame) / imu_rot_lost_z_rad.
   lw / lw_robust  locked vs unlocked twins on the same grid (G1-style training MJCF + G2 nominal latency 0/10/20 ms,
       mu 0.6/1.0; lw_robust: kp 0.85/1.15, +1.8 kg) -> deploy_artifacts/reports/sim2sim_lockwaist.json
       python scripts/deploy/sim2sim.py --cmd lw --ckpt ckpt_0116000 ckpt_0100000 ckpt_0140000 ckpt_0144000 --workers 16
@@ -60,6 +72,10 @@ import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 
 from supermimic.deploy.core import Clip, DeployConfig, DeployCore, OnnxPolicy, SafetyCfg, interpolate_pose, projected_gravity  # noqa: E402
+from supermimic.deploy.imu_model import ENV_VAR as IMU_MODEL_ENV, ImuModel, imu_model_from_env  # noqa: E402
+from supermimic.deploy.waist_coupling import ENV_VAR as WAIST_COUPLING_ENV, WAIST_COUPLING_C, WAIST_COUPLING_K, add_waist_coupling, coupling_from_env  # noqa: E402
+from supermimic.deploy.waist_roll import ENV_VAR as WAIST_ROLL_ENV, apply_actuator_model, set_waist_roll_range, waist_roll_from_env  # noqa: E402
+from supermimic.deploy.waist_roll import env_string as waist_roll_env_string  # noqa: E402
 
 ART = REPO / "deploy_artifacts"
 REPORTS = ART / "reports"
@@ -94,14 +110,36 @@ STAGES = {"air/feet": (0.3, 10.0), "slack": (0.5, 15.0)}
 # q = dq = 0 for them and no motor answers. --lock-waist removes these joints (and their actuators/sensors) from
 # the MJCF, which welds torso to pelvis at q = 0 exactly as Unitree's g1_29dof_lock_waist.xml does.
 LOCKED_WAIST = ("waist_roll_joint", "waist_pitch_joint")
+VEL_CHECK_1KHZ_ENV = "SM_VEL_CHECK_1KHZ"  # "1": G2 also aborts on 1 kHz |dq| samples over the core threshold (--vel-check-1khz)
 WRP = (13, 14)  # motor indices of the locked joints
 
 
-def load_model(xml: Path, lock: bool = False) -> mujoco.MjModel:
-    """MJCF -> MjModel; with lock=True, LOCKED_WAIST joints are deleted (child bodies welded at q = 0)."""
-    if not lock:
-        return mujoco.MjModel.from_xml_path(str(xml))
+def load_model(xml: Path, lock: bool = False, actuator_model: bool = False) -> mujoco.MjModel:
+    """MJCF -> MjModel; with lock=True, LOCKED_WAIST joints are deleted (child bodies welded at q = 0).
+
+    With SM_WAIST_COUPLING set (--waist-coupling, default off) the real-robot waist roll/pitch coupling tendons
+    |roll| + k |pitch| <= c are added (supermimic.deploy.waist_coupling); with SM_WAIST_ROLL range=R set (--waist-roll-range,
+    default off) the waist_roll_joint range becomes +-R (supermimic.deploy.waist_roll); every gate model (G1 training MJCF,
+    G2/G3/standby Unitree MJCF) goes through here. actuator_model=True (the Unitree gate models) also applies the
+    SM_WAIST_ROLL damping / friction."""
+    wc, wr = coupling_from_env(), waist_roll_from_env()
+    rng = None if wr is None else wr["range"]
+    act = actuator_model and wr is not None and (wr["damping"] or wr["friction"] is not None)
+    if lock and (wr is not None):
+        raise SystemExit("--waist-roll-* / SM_WAIST_ROLL cannot be combined with --lock-waist")
+    if not lock and wc is None and rng is None:
+        m = mujoco.MjModel.from_xml_path(str(xml))
+        return apply_actuator_model(m, wr["damping"], wr["friction"]) if act else m
     spec = mujoco.MjSpec.from_file(str(xml))
+    if wc is not None or rng is not None:
+        if lock:
+            raise SystemExit("--waist-coupling / SM_WAIST_COUPLING cannot be combined with --lock-waist")
+        if wc is not None:
+            add_waist_coupling(spec, *wc)
+        if rng is not None:
+            set_waist_roll_range(spec, rng)
+        m = spec.compile()
+        return apply_actuator_model(m, wr["damping"], wr["friction"]) if act else m
     for a in list(spec.actuators):
         if short(a.target) in LOCKED_WAIST:
             spec.delete(a)
@@ -276,6 +314,15 @@ def rms_ex_wrp(err) -> float:
     return rms(np.delete(e, list(WRP), axis=1)) if e.size else float("nan")
 
 
+def make_imu(rob: Robot, o: dict) -> ImuModel | None:
+    """--imu-model / SM_IMU_MODEL=1 (default off): saturating gyro + gyro-only attitude, started at the current true pelvis
+    quaternion. The caller integrates it every physics step (PDSim.imu or by hand) and reads the policy's gyro / quat from
+    ImuModel.observe; physics, falls, tilt errors in the reports stay on the TRUE state."""
+    if not o.get("imu_model", imu_model_from_env()):
+        return None
+    return ImuModel(rob.root()[1])
+
+
 def with_effort(cfg: DeployConfig, hip_roll_effort: float | None) -> DeployConfig:
     """Deploy config with the hip-roll effort limit replaced (used by the core's torque clamp and the simulated motor)."""
     if hip_roll_effort is None:
@@ -392,6 +439,7 @@ def g1_run(ckpt: str, clip_name: str, o: dict) -> dict:
     rec = Recorder(load_policy(ckpt))
     core = DeployCore(cfg, rec, clip, safety(o))
     core.reset(0)
+    imu = make_imu(rob, o)
     stats = StepStats(cfg, clip_segments(raw))
     T = clip.num_frames
     qs, acts, aborts, gyro_err = [], [], [], 0.0
@@ -400,6 +448,8 @@ def g1_run(ckpt: str, clip_name: str, o: dict) -> dict:
     for k in range(T + 5):
         q, dq, gyro, quat = rob.state()
         gyro_err = max(gyro_err, rob.gyro_check())
+        if imu is not None:
+            gyro, quat = imu.observe(gyro, quat, core.frame)
         r = core.step(q, dq, gyro, quat)
         stats.add(dq, r, q)
         if k == 0:
@@ -409,6 +459,8 @@ def g1_run(ckpt: str, clip_name: str, o: dict) -> dict:
             aborts.append((k, r.abort))
         rob.set_ctrl(r.q_target)
         for _ in range(4):
+            if imu is not None:
+                imu.integrate(rob.d.qvel[rob.fv + 3 : rob.fv + 6], m.opt.timestep)
             mujoco.mj_step(m, rob.d)
         qs.append(rob.d.qpos.copy())
         f = min(r.frame, T - 1)
@@ -433,6 +485,7 @@ def g1_run(ckpt: str, clip_name: str, o: dict) -> dict:
         "clip": clip_name, "steps": n - 1, "fail_step": fail_step, "gain_err": gain_err, "gyro_qvel_vs_objvel": gyro_err,
         "track_rmse": rms(jerr[1:]), "track_rmse_ex_wrp": rms_ex_wrp(jerr[1:]), "max_tilt_deg": float(np.degrees(max_tilt)),
         "max_tilt_err_deg": float(np.degrees(max_tilt_err)), "aborts": aborts[:5], "n_aborts": len(aborts), "stats": stats.summary(),
+        **(imu.summary() if imu is not None else {}),
         "_qpos": qs, "_act": np.array(acts), "_obs0": obs0, "_goal0": goal0, "_jq": jq,
     }
 
@@ -446,6 +499,19 @@ def g1_gate(ckpt: str, o: dict, clips=CLIPS, safe=SAFE, ref_prefix: str = "") ->
             refs[p] = dict(np.load(f))
     if "no-tf32" not in refs:
         raise FileNotFoundError(f"run scripts/deploy/sim2sim_ref.py first ({ckpt})")
+    wc = coupling_from_env()
+    for p, r in refs.items():  # G1 compares like with like: the reference must have the same waist coupling (key absent = off)
+        rwc = tuple(float(x) for x in r["waist_coupling"]) if "waist_coupling" in r else None
+        if (rwc is None) != (wc is None) or (wc is not None and not np.allclose(rwc, wc)):
+            raise SystemExit(f"G1 {ckpt}: reference ref_{ref_prefix}{ckpt}_{p}.npz has waist coupling {rwc}, this run {wc}; "
+                             f"re-run scripts/deploy/sim2sim_ref.py with the same {WAIST_COUPLING_ENV}")
+    wr = waist_roll_from_env()
+    wr_rng = None if wr is None else wr["range"]
+    for p, r in refs.items():  # same for the waist-roll range (key absent = MJCF +-0.52)
+        rwr = float(r["waist_roll_range"]) if "waist_roll_range" in r else None
+        if (rwr is None) != (wr_rng is None) or (wr_rng is not None and not np.isclose(rwr, wr_rng)):
+            raise SystemExit(f"G1 {ckpt}: reference ref_{ref_prefix}{ckpt}_{p}.npz has waist roll range {rwr}, this run {wr_rng}; "
+                             f"re-run scripts/deploy/sim2sim_ref.py with the same {WAIST_ROLL_ENV} range")
     ref = refs["no-tf32"]
     clip_order = [str(c) for c in ref["clips"]]
     rows = []
@@ -474,6 +540,7 @@ def g1_gate(ckpt: str, o: dict, clips=CLIPS, safe=SAFE, ref_prefix: str = "") ->
             "action_step1_absdiff": float(np.abs(s["_act"][0] - ref[f"{c}/action"][0]).max()),
             "n_aborts": s["n_aborts"], "aborts": s["aborts"], "stats": s["stats"],
             "gyro_qvel_vs_objvel": s["gyro_qvel_vs_objvel"], "gain_err": s["gain_err"],
+            **{k: v for k, v in s.items() if k.startswith("imu_")},
         }
         row["obs_step1_absdiff"] = float(np.abs(s["_obs0"] - ref["obs0"][i]).max())
         row["goal_step1_absdiff"] = float(np.abs(s["_goal0"] - ref["goal0"][i]).max())
@@ -498,7 +565,7 @@ def g1_gate(ckpt: str, o: dict, clips=CLIPS, safe=SAFE, ref_prefix: str = "") ->
 
 @lru_cache(maxsize=None)
 def unitree_base(lock: bool = False) -> mujoco.MjModel:
-    m = load_model(UNITREE_XML, lock)
+    m = load_model(UNITREE_XML, lock, actuator_model=True)
     m.opt.timestep = 0.001
     return m
 
@@ -513,6 +580,51 @@ def unitree_model(extra_mass: float, friction: float | None, lock: bool = False)
     if friction is not None:
         m.geom_friction[:, 0] = friction  # MuJoCo combines pair friction with max -> set every geom
     return m
+
+
+class PeakTracker:
+    """Per-joint max |dq| [rad/s] over the 1 kHz physics samples, with the reference frame and ms of each peak.
+
+    With `thr` (DeployCore's abort threshold max_vel_frac * velocity_limit) it also counts the 1 kHz samples over it:
+    `first_over` / `step_over` = (ms, frame, joint, dq) of the first such sample in the run / since the caller cleared
+    step_over. DeployCore itself (sim gates AND the real runner, whose core.step runs in the 50 Hz policy loop on the latest
+    lowstate) only checks the one sample per policy step, so a 1 kHz peak between two policy steps is missed there."""
+
+    def __init__(self, names, thr=None):
+        self.names = list(names)
+        self.thr = None if thr is None else np.asarray(thr, float)
+        self.reset()
+
+    def reset(self) -> None:
+        n = len(self.names)
+        self.peak, self.frame, self.ms = np.zeros(n), np.full(n, -1), np.full(n, -1)
+        self.n_over, self.first_over, self.step_over = 0, None, None
+
+    def add(self, dq, frame: int, ms: int) -> None:
+        dq = np.asarray(dq, float)
+        a = np.abs(dq)
+        up = a > self.peak
+        if up.any():
+            self.peak[up], self.frame[up], self.ms[up] = a[up], frame, ms
+        if self.thr is not None:
+            over = a > self.thr
+            if over.any():
+                j = int(np.argmax(np.where(over, a / self.thr, -1.0)))
+                hit = (int(ms), int(frame), self.names[j], float(dq[j]))
+                self.n_over += 1
+                self.first_over = self.first_over or hit
+                self.step_over = self.step_over or hit
+
+    def summary(self, per_joint: bool = True) -> dict:
+        kn = [i for i, n in enumerate(self.names) if "knee" in n]
+        jk = max(kn, key=lambda i: self.peak[i]) if kn else int(np.argmax(self.peak))
+        j = int(np.argmax(self.peak))
+        out = {"knee_peak_1khz": float(self.peak[jk]), "knee_peak_1khz_joint": self.names[jk], "knee_peak_1khz_frame": int(self.frame[jk]),
+               "peak_joint_1khz": [self.names[j], float(self.peak[j]), int(self.frame[j])],
+               "vel_over_1khz_ms": self.n_over, "first_vel_over_1khz": self.first_over}
+        if per_joint:
+            out["dq_peak_1khz"] = {n: [round(float(p), 3), int(f)] for n, p, f in zip(self.names, self.peak, self.frame)}
+        return out
 
 
 class PDSim:
@@ -533,6 +645,9 @@ class PDSim:
         self.ctrlrange[rob.live] = rob.m.actuator_ctrlrange[rob.act, 1]
         self.n_model_sat = np.zeros(29, int)
         self.vmax = 0.0  # max |dq| / velocity_limit at 1 kHz (recorded steps)
+        self.frame = -1  # reference frame tag of the 1 kHz peaks; the caller sets it every policy step
+        self.peaks = PeakTracker(cfg.joint_names)
+        self.imu: ImuModel | None = None  # --imu-model: integrated with the body-frame pelvis rate before every physics step
 
     def command(self, q_t, latency_ms: int, kp=None, kd=None):
         self.pending.append((self.ms + latency_ms, np.asarray(q_t, float).copy(), None if kp is None else np.asarray(kp, float).copy(), None if kd is None else np.asarray(kd, float).copy()))
@@ -553,7 +668,10 @@ class PDSim:
             self.log_tau.append(tau)
             self.n_model_sat += np.abs(tau) > self.ctrlrange + 1e-9
             self.vmax = max(self.vmax, float((np.abs(dq) / self.cfg.velocity_limit).max()))
+            self.peaks.add(dq, self.frame, self.ms)
         self.tau_prev = tau
+        if self.imu is not None:
+            self.imu.integrate(d.qvel[self.rob.fv + 3 : self.rob.fv + 6], self.rob.m.opt.timestep)
         mujoco.mj_step(self.rob.m, d)
         self.ms += 1
 
@@ -586,14 +704,20 @@ def g2_run(o: dict) -> dict:
     rob.set_state(raw["root_pos"][0], raw["root_quat_wxyz"][0], pose0)
     dz = rob.place_on_ground()
     sim = PDSim(rob, cfg, cfg.effort_limit)
+    imu = sim.imu = make_imu(rob, o)
     kp = cfg.kp * kps
     sim.command(pose0, 0, kp, cfg.kd.copy())
     for _ in range(settle_ms):  # optional settle holding the frame-0 pose with the policy gains
         sim.step_ms(record=False)
     settle_fall = fell(rob)
     tilt_at_start = float(np.degrees(tilt_of(rob.d.qpos[rob.fq + 3 : rob.fq + 7])))
-    core = DeployCore(cfg, load_policy(ckpt), clip, safety(o))
+    sfg = safety(o)
+    core = DeployCore(cfg, load_policy(ckpt), clip, sfg)
     core.reset(0)
+    sim.peaks.thr = sfg.max_vel_frac * cfg.velocity_limit
+    # vel_check_1khz: also abort on any 1 kHz sample over DeployCore's |dq| threshold (worst case over the sampling phase);
+    # off = DeployCore's own check on the one sample per 50 Hz policy step, which is what the real runner does
+    vel_1khz = bool(o.get("vel_check_1khz", os.environ.get(VEL_CHECK_1KHZ_ENV) == "1"))
     stats = StepStats(cfg, clip_segments(raw))
     T = clip.num_frames
     fall_step, aborts, jerr, lim_hits, steps, n_hard = -1, [], [], 0, 0, 0
@@ -601,6 +725,8 @@ def g2_run(o: dict) -> dict:
     near = 0.01
     while True:
         q, dq, gyro, quat = rob.state()
+        if imu is not None:
+            gyro, quat = imu.observe(gyro, quat, core.frame)
         r = core.step(q, dq, gyro, quat)
         stats.add(dq, r, q)
         q_send = r.q_target
@@ -611,8 +737,12 @@ def g2_run(o: dict) -> dict:
         sim.command(q_send, lat)
         if r.abort:
             aborts.append((steps, r.abort))
+        sim.frame, sim.peaks.step_over = r.frame - 1, None  # frame the step started at (StepStats.mark convention)
         for _ in range(20):
             sim.step_ms()
+        if vel_1khz and sim.peaks.step_over and not r.abort:
+            _, f1, jn, v1 = sim.peaks.step_over
+            aborts.append((steps, f"joint velocity {jn} {v1:.1f} rad/s (1 kHz, frame {f1})"))
         steps += 1
         q = rob.jq()
         f = min(r.frame, T - 1)
@@ -654,6 +784,7 @@ def g2_run(o: dict) -> dict:
         "first_step_tau_ratio_max": float((w / cfg.effort_limit).max()),
         "model_sat_ms": {cfg.joint_names[j]: int(sim.n_model_sat[j]) for j in np.nonzero(sim.n_model_sat)[0]},
         "joint_limit_hit_steps": lim_hits, "hard_clip_steps": n_hard, "vfrac_1khz_max": sim.vmax,
+        "vel_check_1khz": vel_1khz, **sim.peaks.summary(), **(imu.summary() if imu is not None else {}),
         "track_rmse": rms(np.array(jerr)), "track_rmse_ex_wrp": rms_ex_wrp(np.array(jerr)), "stats": stats.summary(),
         "disp_xy": disp.tolist(), "ref_disp_xy": ref_disp.tolist(), "disp_err_m": float(np.linalg.norm(disp - ref_disp)),
     }
@@ -748,6 +879,7 @@ def g3_run(o: dict) -> dict:
     else:
         band = {"on": support in ("band", "feet"), "body": rob.pelvis, "k": BAND_K, "d": BAND_D, "anchor": rob.d.qpos[rob.fq : rob.fq + 3].copy()}
     sim = PDSim(rob, cfg, cfg.effort_limit)
+    imu = sim.imu = make_imu(rob, o)  # the real IMU integrates through stand / interp / HOLD as well
     skp, skd = stand_gains(cfg)
     pose0 = np.clip(clip.joint_pos[0], cfg.soft_lower, cfg.soft_upper)
     upright = True
@@ -813,6 +945,8 @@ def g3_run(o: dict) -> dict:
         te = float(np.arccos(np.clip(np.dot(projected_gravity(quat), g_ref) / (np.linalg.norm(g_ref) + 1e-9), -1, 1)))
         max_tilt_err = max(max_tilt_err, te)
         stats.mark(core.frame, te)
+        if imu is not None:
+            gyro, quat = imu.observe(gyro, quat, core.frame)
         r = core.step(q, dq, gyro, quat)
         stats.add(dq, r, q)
         if steps == 0:
@@ -910,7 +1044,7 @@ def g3_run(o: dict) -> dict:
         "first_step_tau_ratio_max": float((w / eff).max()) if len(w) else None,
         "max_tau_ratio_policy": float((np.abs(tau[s_start:s_end]) / eff).max()) if s_end > s_start else None,
         "max_tau_ratio_end_blend": float((eb / eff).max()), "vfrac_1khz_max_all": sim.vmax,
-        "stats": stats.summary(),
+        "stats": stats.summary(), **(imu.summary() if imu is not None else {}),
     }
 
 
@@ -1314,6 +1448,7 @@ def standby_run(o: dict) -> dict:
     rob.place_on_ground()
     band = {"on": True, "anchor": rob.d.qpos[rob.fq : rob.fq + 3].copy()}
     sim = PDSim(rob, cfg, cfg.effort_limit)
+    imu = sim.imu = make_imu(rob, o)  # integrates from the stand pose on, as the real IMU
     skp, skd = stand_gains(cfg)
     skp, kp_pol = skp * kps, cfg.kp * kps  # motor gain error scales every gain we send (kd as in G2: unscaled)
     pose0 = np.clip(clip.joint_pos[0], cfg.soft_lower, cfg.soft_upper)
@@ -1339,8 +1474,10 @@ def standby_run(o: dict) -> dict:
         sim.command(pose0, 0)
         run_ms(20)
     band["on"] = False  # gantry slack from the moment the policy takes over
-    core = DeployCore(cfg, load_policy(ckpt), static_clip(clip, 0), safety(o))
+    sfg = safety(o)
+    core = DeployCore(cfg, load_policy(ckpt), static_clip(clip, 0), sfg)
     core.reset(0)
+    sim.peaks.thr = sfg.max_vel_frac * cfg.velocity_limit
     ph: dict[str, dict] = {}
     marks = {}
     first = [True]
@@ -1359,6 +1496,7 @@ def standby_run(o: dict) -> dict:
         rec = {"te": [], "a": [], "vf": [], "dq": [], "dxy": [], "dyaw": [], "aborts": [], "xy": [], "ok": []}
         pre = name == "standby_pre"
         k = 0
+        sim.peaks.reset()  # 1 kHz |dq| peaks per policy phase
         while st["upright"]:
             if pre:
                 if k >= n_steps and rec["ok"] and rec["ok"][-1]:
@@ -1370,7 +1508,10 @@ def standby_run(o: dict) -> dict:
             q, dq, gyro, quat = rob.state()
             g_ref = core.clip.proj_grav[min(core.frame, core.clip.num_frames - 1)]
             te = float(np.arccos(np.clip(np.dot(projected_gravity(quat), g_ref) / (np.linalg.norm(g_ref) + 1e-9), -1, 1)))
+            if imu is not None:
+                gyro, quat = imu.observe(gyro, quat, core.frame)
             r = core.step(q, dq, gyro, quat, advance=advance)
+            sim.frame = r.frame - 1 if advance else r.frame
             if first[0]:
                 sim.command(r.q_target, lat, kp_pol, cfg.kd)  # gains switch together with the first policy target
                 first[0] = False
@@ -1395,7 +1536,8 @@ def standby_run(o: dict) -> dict:
             if advance and r.done:
                 break
         te, a, vf, dqm = (np.array(rec[x]) for x in ("te", "a", "vf", "dq"))
-        out = {"steps": k, "aborts": len(rec["aborts"]), "first_abort": rec["aborts"][0] if rec["aborts"] else None}
+        out = {"steps": k, "aborts": len(rec["aborts"]), "first_abort": rec["aborts"][0] if rec["aborts"] else None,
+               **sim.peaks.summary(per_joint=False)}
         if k:
             out |= {"max_tilt_err_deg": float(np.degrees(te.max())), "mean_tilt_err_deg": float(np.degrees(te.mean())),
                     "max_abs_a": float(a.max()), "max_vfrac": float(vf.max()), "max_dq": float(dqm.max()),
@@ -1463,6 +1605,7 @@ def standby_run(o: dict) -> dict:
     return {**o, "upright": st["upright"], "fall_phase": st["fall_phase"], "fall_s": st["fall_s"], "completed": completed,
             "aborts": n_ab, "phases": ph, "jumps": J, "smooth": smooth, "standby_max_tilt_err_deg": sb_te,
             "r1x_never": bool(sp.get("r1x_never", False)), "r1x_wait_s": sp.get("r1x_wait_s"), "start_moving": bool(sp.get("start_moving", False)),
+            **(imu.summary() if imu is not None else {}),
             "pass": bool(completed and n_ab == 0 and sb_te < STANDBY_R1X_TILT_DEG and smooth)}
 
 
@@ -1938,6 +2081,25 @@ def main() -> None:
                     help="G1 29dof with waist roll/pitch locked at 0: joints removed from both MJCFs, q = dq = 0 reported, actions 13/14 not "
                          "applied; g1/g2/g3 results go to sim2sim_lw_<ckpt>.json. --cmd lw / lw_robust run the locked-vs-unlocked comparison "
                          "(sim2sim_lockwaist.json)")
+    ap.add_argument("--waist-coupling", action="store_true",
+                    help="add the real-G1 waist roll/pitch coupling |roll| + k |pitch| <= c (two limited fixed tendons) to every gate model; "
+                         "same as exporting SM_WAIST_COUPLING=k,c (inherited by the workers). Reports get a _wc suffix after the tag "
+                         "(sim2sim_<tag>_wc_<ckpt>.json, SIM2SIM_standby_<tag>_wc_<ckpt>.md, sim2sim_wc_<ckpt>.json) and record (k, c); "
+                         "G1 needs references made by sim2sim_ref.py under the same SM_WAIST_COUPLING")
+    ap.add_argument("--imu-model", action="store_true",
+                    help="real-G1 pelvis IMU in G1/G2/G3/standby: gyro clipped at +-500 deg/s per axis, quaternion integrated at the physics "
+                         "rate from the clipped gyro (no accelerometer correction; supermimic.deploy.imu_model). Same as exporting "
+                         f"{IMU_MODEL_ENV}=1 (inherited by the workers). Reports get an _imu suffix after _wc (sim2sim_<tag>_wc_imu_<ckpt>.json, "
+                         "SIM2SIM_standby_<tag>_imu_<ckpt>.md, ...) and record imu_model true")
+    ap.add_argument("--waist-roll-range", type=float, default=None,
+                    help="waist_roll_joint range +-R in every gate model instead of +-0.52 (real G1 reaches 0.70; supermimic.deploy.waist_roll); "
+                         f"with --waist-roll-damping / --waist-roll-friction same as exporting {WAIST_ROLL_ENV}='range=R,damping=D,friction=F'. "
+                         "Reports get a _wr suffix after _wc; G1 needs references made by sim2sim_ref.py with the same range")
+    ap.add_argument("--waist-roll-damping", type=float, default=0.0,
+                    help="extra waist-roll dof_damping [Nm s/rad] in the Unitree G2/G3/standby models (fit on the real logs: ~1.8 = kd x2)")
+    ap.add_argument("--waist-roll-friction", type=float, default=None, help="waist-roll frictionloss [Nm] in the Unitree models (MJCF 0.2)")
+    ap.add_argument("--waist-coupling-k", type=float, default=WAIST_COUPLING_K)
+    ap.add_argument("--waist-coupling-c", type=float, default=WAIST_COUPLING_C)
     ap.add_argument("--clips", nargs="+", default=None,
                     help="run the clip-set gates (g1/g2/g3 with the runner's slack/ground profiles, report) on these clips instead of the "
                          "built-in set; results -> sim2sim_<tag>_<ckpt>.json + SIM2SIM_<tag>.md, G1 refs ref_<tag>_<ckpt>_<p>.npz")
@@ -1953,8 +2115,64 @@ def main() -> None:
     ap.add_argument("--standby-r1x-window-s", type=float, default=STANDBY_R1X_WIN_S, help="--cmd standby: R1+X check window (runner --standby-window-s)")
     ap.add_argument("--standby-r1x-min-s", type=float, default=STANDBY_R1X_MIN_S, help="--cmd standby: R1+X minimum standby (runner --standby-min-s)")
     ap.add_argument("--standby-r1x-cap-s", type=float, default=STANDBY_R1X_CAP_S, help="--cmd standby: re-press R1+X for at most this long after --standby-pre-s")
+    ap.add_argument("--vel-check-1khz", action="store_true",
+                    help="G2: also count an abort when any 1 kHz physics sample has |dq| > max_vel_frac * velocity_limit (worst case over "
+                         "the sampling phase); default: DeployCore's check on the one sample per 50 Hz policy step, as the real runner "
+                         f"(g1_runner.py calls core.step in its 50 Hz loop). Same as exporting {VEL_CHECK_1KHZ_ENV}=1. The 1 kHz peaks "
+                         "(knee_peak_1khz, peak_joint_1khz, dq_peak_1khz, vel_over_1khz_ms) are recorded either way")
     a = ap.parse_args()
+    if a.vel_check_1khz:
+        os.environ[VEL_CHECK_1KHZ_ENV] = "1"
+    if a.waist_coupling:
+        os.environ[WAIST_COUPLING_ENV] = f"{a.waist_coupling_k},{a.waist_coupling_c}"
+    if a.imu_model:
+        os.environ[IMU_MODEL_ENV] = "1"
+    if a.waist_roll_range is not None or a.waist_roll_damping or a.waist_roll_friction is not None:
+        os.environ[WAIST_ROLL_ENV] = waist_roll_env_string(a.waist_roll_range, a.waist_roll_damping, a.waist_roll_friction)
+    wc = coupling_from_env()
+    wr = waist_roll_from_env()
+    imu = imu_model_from_env()
+    imus = "_imu" if imu else ""
+    # report-name suffix: coupled / waist-roll / IMU-model results never overwrite the plain ones
+    wcs = ("" if wc is None else "_wc") + ("" if wr is None else "_wr") + imus
     cmds = set(a.cmd.split(","))
+    if imu:
+        print(f"  IMU model ON: gyro clipped at +-500 deg/s, gyro-only attitude; reports suffixed {imus}", flush=True)
+        if cmds & {"lw", "lw_robust"}:
+            raise SystemExit("--cmd lw / lw_robust (locked-vs-unlocked waist) cannot run with --imu-model / SM_IMU_MODEL")
+    if wr is not None:
+        print(f"  waist roll model ON: {wr} (range in every model, damping/friction in the Unitree models); reports suffixed {wcs}", flush=True)
+        if a.lock_waist or cmds & {"lw", "lw_robust"}:
+            raise SystemExit("--waist-roll-* / SM_WAIST_ROLL cannot be combined with --lock-waist / --cmd lw")
+    if wc is not None:
+        print(f"  waist coupling ON: |roll| + k |pitch| <= c with (k, c) = {wc}; reports suffixed {wcs}", flush=True)
+        if a.lock_waist:
+            raise SystemExit("--waist-coupling / SM_WAIST_COUPLING cannot be combined with --lock-waist")
+        if cmds & {"lw", "lw_robust"}:
+            raise SystemExit("--cmd lw / lw_robust (locked-vs-unlocked waist) cannot run with --waist-coupling / SM_WAIST_COUPLING")
+
+    def wc_md(md: str) -> str:
+        if imu:
+            md = "> IMU model ON: gyro clipped at +-500 deg/s per axis, quaternion = gyro-only integration of the clipped gyro (supermimic.deploy.imu_model)\n\n" + md
+        if wr is not None:
+            md = f"> waist roll model ON: {wr} (supermimic.deploy.waist_roll)\n\n" + md
+        return md if wc is None else f"> waist coupling ON: |roll| + {wc[0]} |pitch| <= {wc[1]} (supermimic.deploy.waist_coupling)\n\n" + md
+
+    def wc_check(f: Path, res: dict) -> None:
+        if res and res.get("waist_coupling") != (None if wc is None else list(wc)):
+            raise SystemExit(f"{f} was written with waist coupling {res.get('waist_coupling')}, this run {wc}; use another --tag")
+        if res and res.get("waist_roll") != wr:
+            raise SystemExit(f"{f} was written with waist roll {res.get('waist_roll')}, this run {wr}; use another --tag")
+        if res and bool(res.get("imu_model", False)) != imu:
+            raise SystemExit(f"{f} was written with imu_model {bool(res.get('imu_model', False))}, this run {imu}; use another --tag")
+
+    def mark(res: dict) -> None:  # record the model options in a result json (keys absent = off, as before)
+        if wc is not None:
+            res["waist_coupling"] = list(wc)
+        if wr is not None:
+            res["waist_roll"] = wr
+        if imu:
+            res["imu_model"] = True
     if "standby_report" in cmds:
         res = json.loads(a.standby_json.read_text())
         md = a.standby_json.with_name(a.standby_json.name.replace("sim2sim_", "SIM2SIM_")).with_suffix(".md")
@@ -1969,11 +2187,12 @@ def main() -> None:
                                              ("mass", a.standby_mass), ("fric", a.standby_fric)) if v}
             res = standby_gate(c, clips, a.workers, a.standby_pre_s, a.standby_post_s, a.lock_waist, grid,
                                {"win_s": a.standby_r1x_window_s, "min_s": a.standby_r1x_min_s, "cap_s": a.standby_r1x_cap_s})
-            tag = "standby" + ("" if clips == STANDBY_CLIPS and not grid and a.tag == "clips" else f"_{a.tag}") + ("_lw" if a.lock_waist else "")
+            tag = "standby" + ("" if clips == STANDBY_CLIPS and not grid and a.tag == "clips" else f"_{a.tag}") + ("_lw" if a.lock_waist else "") + wcs
+            mark(res)
             f = REPORTS / f"sim2sim_{tag}_{c}.json"
             f.write_text(json.dumps(strip(res), indent=1))
             md = REPORTS / f"SIM2SIM_{tag}_{c}.md"
-            md.write_text(write_standby_md(res))
+            md.write_text(wc_md(write_standby_md(res)))
             print(f"  wrote {f}\n  wrote {md}")
             print(md.read_text())
         return
@@ -1982,23 +2201,30 @@ def main() -> None:
     REPORTS.mkdir(parents=True, exist_ok=True)
     if a.clips:
         for c in a.ckpt:
-            f = REPORTS / f"sim2sim_{a.tag}_{c}.json"
+            f = REPORTS / f"sim2sim_{a.tag}{wcs}_{c}.json"
             res = json.loads(f.read_text()) if f.exists() else {}
             if res.get("clips") not in (None, list(a.clips)):
                 raise SystemExit(f"{f} holds clips {res['clips']}; use another --tag")
-            res = clipset_gates(c, a.clips, a.tag, a.workers, cmds, res)
+            wc_check(f, res)
+            res = clipset_gates(c, a.clips, a.tag, a.workers, cmds, res)  # G1 refs keep the plain tag (ref_<tag>_<ckpt>_<p>.npz)
+            mark(res)
             f.write_text(json.dumps(strip(res), indent=1))
             print(f"  wrote {f}")
             if "report" in cmds and "summary" in res:
-                md = REPORTS / f"SIM2SIM_{a.tag}_{c}.md"
-                md.write_text(write_clipset_md(res))
+                md = REPORTS / f"SIM2SIM_{a.tag}{wcs}_{c}.md"
+                md.write_text(wc_md(write_clipset_md(res)))
                 print(f"  wrote {md}")
         return
 
     def path(c):
-        return REPORTS / (f"sim2sim_lw_{c}.json" if a.lock_waist else f"sim2sim_{c}.json")
+        return REPORTS / (f"sim2sim_lw{imus}_{c}.json" if a.lock_waist else f"sim2sim{wcs}_{c}.json")
 
     results = {c: (json.loads(path(c).read_text()) if path(c).exists() else {"ckpt": c}) for c in a.ckpt}
+    if wc is not None or wr is not None or imu:
+        for c, r in results.items():
+            if len(r) > 1:  # an existing result file
+                wc_check(path(c), r)
+            mark(r)
 
     def save():
         for c, r in results.items():
@@ -2054,9 +2280,9 @@ def main() -> None:
     elif "report" in cmds:
         cmpf = REPORTS / "sim2sim_model_compare.json"
         allres = {c: json.loads(path(c).read_text()) for c in CKPTS if path(c).exists()}
-        md = write_md(allres, json.loads(cmpf.read_text()) if cmpf.exists() else None)
-        (REPORTS / "SIM2SIM.md").write_text(md)
-        print(f"  wrote {REPORTS / 'SIM2SIM.md'}")
+        md = wc_md(write_md(allres, json.loads(cmpf.read_text()) if cmpf.exists() else None))
+        (REPORTS / f"SIM2SIM{wcs}.md").write_text(md)
+        print(f"  wrote {REPORTS / f'SIM2SIM{wcs}.md'}")
 
 
 if __name__ == "__main__":

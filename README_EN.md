@@ -8,6 +8,8 @@ The method comes from the [SuperMimic paper](https://arxiv.org/abs/2610.28480) (
 
 <p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.0/shanshenbu_real_robot_v3.mp4"><img src="docs/assets/shanshenbu_demo.gif" alt="Real G1 dancing shanshenbu: human source video on the left, robot on the right" width="720"></a><br><sub>Left: human source video. Right: real G1. Click for the full video with sound (~46 s).</sub></p>
 
+<p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.1/shanshenbu_pro_real_robot.mp4"><img src="docs/assets/shanshenbu_pro_demo.gif" alt="Real G1 dancing shanshenbu Pro: human source video on the left, robot on the right" width="480"></a><br><sub>Shanshenbu Pro (v1.1, checkpoint <code>e24_0355000</code>): two fast spins and a jump with a one-foot landing. Left: human source video. Right: real G1. Click for the video with sound (~15 s). Details in <a href="docs/REAL_ROBOT_LEAN35KFS.md">docs/REAL_ROBOT_LEAN35KFS.md</a>.</sub></p>
+
 The real-robot demo video and pretrained models are on [GitHub Releases](https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases).
 
 > **Safety warning**: the real-robot code drives the G1's motors directly. A wrong model, wrong settings or an operator mistake can make the robot fall, break, or hurt someone. Only run it with the robot on a hoist, and always have one person holding the remote, ready to press L2+B to put the robot into damping mode (a soft emergency stop). Read [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) in full before you start. This project is provided as is. Use it at your own risk.
@@ -30,6 +32,7 @@ A score of 1.0 means the robot follows the reference motion perfectly. Higher is
 
 - With the paper's exact setup our LAFAN1 score is well below the paper's. Adding that position input closes the gap, but the real robot can't measure its own position in the room, so such a model can't be deployed.
 - Real robot: a G1 ran the full ~46 s sequence of 4 dances back to back. Its body tilt was never more than 16.3° off the reference (the safety stop is at 20°).
+- New in v1.1 (2026-10): a G1 ran the 22 s dance `shanshen_duosuomao_lean35kfs_pad2`, which has two fast spins and a jump landing on one foot, from start to end twice in a row (`e24_0355000`, rope attached but slack). This is one checkpoint run twice, with no ablation. All real attempts on this dance with 9 earlier checkpoints had failed. The failures, what we changed and which sim tests predicted the result are in [docs/REAL_ROBOT_LEAN35KFS.md](docs/REAL_ROBOT_LEAN35KFS.md).
 - For detailed numbers and the reasons behind them, see [docs/METHOD.md](docs/METHOD.md#results).
 
 ## Quick start
@@ -107,6 +110,7 @@ These run in the deploy environment; setup is in [docs/SIM2SIM.md](docs/SIM2SIM.
 | [docs/VIDEO_TO_MOTION.md](docs/VIDEO_TO_MOTION.md) | How to turn a dance video into motion the robot can perform |
 | [docs/SIM2SIM.md](docs/SIM2SIM.md) | How to export a model, and which simulation tests it must pass before the real robot |
 | [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) | Real-robot manual: safety, remote buttons, step-by-step procedure, troubleshooting |
+| [docs/REAL_ROBOT_LEAN35KFS.md](docs/REAL_ROBOT_LEAN35KFS.md) | The spin / landing dance on the real robot (`e24_0355000`): failures and causes, training recipe, sim gates, deploy command |
 | [docs/REFERENCES.md](docs/REFERENCES.md) | BibTeX for everything we cite |
 
 ## Pretrained models
@@ -115,6 +119,7 @@ Download them from [GitHub Releases](https://github.com/NJU-R-L-Group-Embodied-L
 
 - `e11c_0220000`: the base model, trained on BONES-SEED.
 - `e13i_0291000`: the base model trained further on BONES-SEED plus 4 custom dances (not on the 4 dances alone). The Release also has a video of it dancing on the real robot.
+- `e24_0355000` (v1.1, `e24_0355000_lean35kfs.tar.gz`): a fine-tune on the single dance `shanshen_duosuomao_lean35kfs_pad2` only. It is not a general tracker, so use it only with this clip. The archive also contains the clip (training npz and deploy goal table), the one-clip training library and the real-robot reset states, and it extracts at the repository root. Its training command is [scripts/train/train_lean35kfs_e24.sh](scripts/train/train_lean35kfs_e24.sh) (the parent checkpoint is not released), and its sim gate is [scripts/train/gate_lean35kfs.sh](scripts/train/gate_lean35kfs.sh). The new training options it uses (waist coupling and waist roll range, command-latency, push and waist-roll randomization, saturating IMU observation, knee-speed and yaw-rate hinges, real-state resets) are all off by default; see [docs/METHOD.md](docs/METHOD.md#options-that-deviate-from-the-paper-and-known-differences).
 
 To use one: extract it into `deploy_artifacts/`, re-run the simulation tests from [docs/SIM2SIM.md](docs/SIM2SIM.md), then follow [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) to run it on the robot. The scripts default to older models that are not in the Release, so always pass `--ckpt e13i_0291000` (sim2sim) or `--artifacts deploy_artifacts/e13i_0291000` (runner). Both models were trained on BONES-SEED; check its data terms before you use them.
 
@@ -123,7 +128,10 @@ The Release does not include the motion goal table `deploy_artifacts/clips/<clip
 ```bash
 mkdir -p deploy_artifacts
 tar -xzf /path/to/e13i_0291000.tar.gz -C deploy_artifacts/   # -> deploy_artifacts/e13i_0291000/
+tar -xzf /path/to/e24_0355000_lean35kfs.tar.gz -C .            # v1.1, from the repository root: deploy_artifacts/e24_0355000/, deploy_artifacts/clips/, data/...
 ```
+
+In the v1.1 package `policy.onnx` is already ONNX IR 9 and runs on PC2 as it is; `policy_ir10.onnx` is the original export. For `e24_0355000` the Release already includes the goal table `deploy_artifacts/clips/shanshen_duosuomao_lean35kfs_pad2.npz`.
 
 ## License
 

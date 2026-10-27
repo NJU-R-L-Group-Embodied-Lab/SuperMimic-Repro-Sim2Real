@@ -7,9 +7,11 @@ from dataclasses import dataclass
 import torch
 
 from supermimic.data.replay_buffer import StartBatch
+from supermimic.envs.imu_model import ImuImagCfg, imu_gravity_step, imu_observation, random_tilt
 from supermimic.envs.mdp.motion_library import MotionLibrary
 from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagStep
 from supermimic.policy.nets import Policy
+from supermimic.kinematics.rotations import projected_gravity
 from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
 from supermimic.world_model.wm_trainer import reference_at
 from supermimic.world_model.world_model import WorldModel
@@ -42,6 +44,7 @@ def imagine(
     obs_noise: bool = True,
     step_fn: ImagStep | None = None,
     anchor_obs: bool = False,
+    imu: ImuImagCfg | None = None,
 ) -> ImagRollout:
     device = start.state.device
     n = start.state.shape[0]
@@ -70,8 +73,34 @@ def imagine(
             rel = rel + (torch.rand_like(rel) * 2 - 1) * anchor_noise_half
         return torch.cat([g, rel], dim=-1)
 
+    # Saturating-IMU model (DEVIATION when imu.prob > 0, envs/imu_model.py): for flagged rollouts the policy reads the
+    # clipped gyro and a gravity estimate integrated from it, started from the true gravity of the oldest history state
+    # tilted by U[0, init_tilt_deg] and propagated through the logged history, then per 50 Hz step from the predicted
+    # angular velocity. Only the policy input changes (states, rewards, critic keep the true quantities). The estimate
+    # stays differentiable: it is a smooth function of the predicted angular velocity (zero gradient where clipped, as on
+    # the sensor), and the rotations are norm-preserving, so it adds no unstable path over the short horizon.
+    use_imu = imu is not None and imu.prob > 0.0
+    if use_imu:
+        imu_flag = torch.rand(n, device=device) < imu.prob
+        imu_k = torch.rand(n, device=device) * imu.accel_k_max
+        dt = wm.spec.dt
+
+        def imu_obs(o, s_t, g_est, first=False):
+            g_true = projected_gravity(s_t[..., 3:7])
+            if first:
+                g_est = random_tilt(g_true, imu.init_tilt_deg)
+            else:
+                g_est = imu_gravity_step(g_est, s_t[..., 39:42], g_true, imu_k, imu.gyro_limit, dt)
+            return imu_observation(o, g_est, imu_flag, imu.gyro_limit), g_est
+
     # Initial observation history from the logged states/actions (noise re-sampled per frame).
-    hist = [add_noise(analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)) for i in range(start.hist_states.shape[0])]
+    hist = []
+    g_est = None
+    for i in range(start.hist_states.shape[0]):
+        o = analytic_observation(start.hist_states[i], start.hist_actions[i], start.xi, q0)
+        if use_imu:
+            o, g_est = imu_obs(o, start.hist_states[i], g_est, first=i == 0)
+        hist.append(add_noise(o))
     s = start.state
     frame = start.frame.clone()
     a_prev = start.prev_action
@@ -110,6 +139,8 @@ def imagine(
 
         frame = frames_all[t + 1]
         ref = ref_at(t + 1)
+        if use_imu:
+            obs_clean, g_est = imu_obs(obs_clean, s_next, g_est)
         hist = hist[1:] + [add_noise(obs_clean)]
         a_prev = a
         s = s_next

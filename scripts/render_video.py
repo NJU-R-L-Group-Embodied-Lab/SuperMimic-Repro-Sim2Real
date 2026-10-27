@@ -23,6 +23,7 @@ import torch
 import tyro
 
 from supermimic.data.motion_convert import g1_xml_path
+from supermimic.deploy.waist_coupling import env_args as coupling_args, resolve_coupling
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
@@ -54,6 +55,7 @@ def rollout(ckpt: Path, files: list[str], max_steps: int, device: str, lock_wais
         anchor_obs=cfg["env"].get("anchor_obs", False),
         lock_waist=lock,
         lock_waist_refs=refs,
+        **coupling_args(resolve_coupling(cfg["env"])),  # waist coupling: SM_WAIST_COUPLING, else as trained (default off)
     )
     env = make_env(args, device=device)
     try:

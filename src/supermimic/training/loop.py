@@ -32,6 +32,10 @@ class Trainer:
         self.cfg = cfg
         cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+        cfg.policy_trainer.imu_sat_prob = cfg.env.imu_sat_prob
+        cfg.policy_trainer.imu_gyro_limit = cfg.env.imu_gyro_limit
+        cfg.policy_trainer.imu_accel_k_max = cfg.env.imu_accel_k_max
+        cfg.policy_trainer.imu_init_tilt_deg = cfg.env.imu_init_tilt_deg
         if cfg.env.lock_waist:
             from supermimic.envs.lock_waist import LOCKED_JOINT_IDS
 
@@ -82,8 +86,28 @@ class Trainer:
                 locked_action_weight=cfg.env.locked_action_weight,
                 tilt_hinge_weight=cfg.env.tilt_hinge_weight,
                 tilt_hinge_knee=cfg.env.tilt_hinge_knee,
+                yaw_rate_hinge_weight=cfg.env.yaw_rate_hinge_weight,
+                yaw_rate_hinge_thr=cfg.env.yaw_rate_hinge_thr,
+                imu_sat_prob=cfg.env.imu_sat_prob,
+                imu_gyro_limit=cfg.env.imu_gyro_limit,
+                imu_accel_k_max=cfg.env.imu_accel_k_max,
                 dr_kp_range=cfg.env.dr_kp_range,
                 dr_torso_mass_add=cfg.env.dr_torso_mass_add,
+                dr_action_delay_substeps=cfg.env.dr_action_delay_substeps,
+                dr_knee_effort_scale=cfg.env.dr_knee_effort_scale,
+                dr_push_prob=cfg.env.dr_push_prob,
+                dr_push_frames=cfg.env.dr_push_frames,
+                dr_push_steps=cfg.env.dr_push_steps,
+                dr_push_force=cfg.env.dr_push_force,
+                dr_push_torque=cfg.env.dr_push_torque,
+                dr_push_clips=cfg.env.dr_push_clips,
+                waist_coupling=cfg.env.waist_coupling,
+                waist_coupling_k=cfg.env.waist_coupling_k,
+                waist_coupling_c=cfg.env.waist_coupling_c,
+                waist_roll_range=cfg.env.waist_roll_range,
+                waist_roll_model_soft_limits=cfg.env.waist_roll_model_soft_limits,
+                dr_waist_roll_damping=cfg.env.dr_waist_roll_damping,
+                dr_waist_roll_friction=cfg.env.dr_waist_roll_friction,
                 seed=cfg.seed + 1000 * self.rank,
                 extra_command_kwargs=dict(
                     gmax_mode=cfg.env.sampler_gmax_mode,
@@ -94,6 +118,20 @@ class Trainer:
                     fail_reset_frac=cfg.env.fail_reset_frac,
                     fail_reset_list=None if cfg.env.fail_reset_list is None else str(cfg.env.fail_reset_list),
                     fail_reset_window_s=cfg.env.fail_reset_window_s,
+                    **(
+                        dict(
+                            real_reset_prob=cfg.env.real_reset_prob,
+                            real_reset_file=str(cfg.env.real_reset_file),
+                            real_reset_vel=cfg.env.real_reset_vel,
+                            real_reset_dz=tuple(cfg.env.real_reset_dz),
+                            real_reset_dvz=cfg.env.real_reset_dvz,
+                            real_reset_tilt_deg=cfg.env.real_reset_tilt_deg,
+                            real_reset_joint_pos_noise=cfg.env.real_reset_joint_pos_noise,
+                            real_reset_joint_vel_noise=cfg.env.real_reset_joint_vel_noise,
+                        )
+                        if cfg.env.real_reset_file is not None
+                        else {}
+                    ),
                 ),
             ),
             device=self.device,
@@ -111,6 +149,15 @@ class Trainer:
         reward_cfg = TrackingRewardCfg(
             w_tilt_hinge=cfg.env.tilt_hinge_weight, tilt_hinge_knee=cfg.env.tilt_hinge_knee, w_joint_torque=cfg.env.joint_torque_weight
         )
+        if cfg.env.joint_vel_hinge_weight != 0.0:
+            from supermimic.data.motion_convert import G1_JOINT_NAMES
+
+            assert list(robot.joint_names) == list(G1_JOINT_NAMES), "state joint order != G1_JOINT_NAMES"
+            reward_cfg.w_joint_vel_hinge = cfg.env.joint_vel_hinge_weight
+            reward_cfg.joint_vel_hinge_ids = tuple(G1_JOINT_NAMES.index(n) for n in cfg.env.joint_vel_hinge_joints)
+            reward_cfg.joint_vel_hinge_thr = cfg.env.joint_vel_hinge_thr
+        reward_cfg.w_yaw_rate_hinge = cfg.env.yaw_rate_hinge_weight
+        reward_cfg.yaw_rate_hinge_thr = cfg.env.yaw_rate_hinge_thr
         pd = None
         if cfg.env.joint_torque_weight != 0.0:
             pd = joint_torque_constants(cfg.env.joint_torque_jw, cfg.env.joint_torque_jw_default, self.device)

@@ -134,6 +134,7 @@ class AnalyticHeads:
             ref_root_quat_w=ref.root_quat_w,
             pd=self.pd,
             joint_vel=s_next[..., 42:71],
+            root_ang_vel_b=s_next[..., 39:42],
         )
 
     @staticmethod

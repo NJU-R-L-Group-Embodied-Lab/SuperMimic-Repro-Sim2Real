@@ -48,6 +48,15 @@ class TrackingRewardCfg:
     # tau = kp (q0 + scale a - q) - kd dq the PD torque the actuator is asked for (not clipped), aimed at the waist /
     # knee heating seen on the real robot. Needs the `pd` constants passed to tracking_reward_terms.
     w_joint_torque: float = 0.0
+    # DEVIATION from the paper when w_joint_vel_hinge != 0 (default off): -|w| * sum_j max(0, |dq_j| - thr)^2 over
+    # joint_vel_hinge_ids [rad/s], aimed at the knee over-speed the deploy runner aborts on (0.8 x 20 rad/s on ground).
+    w_joint_vel_hinge: float = 0.0
+    joint_vel_hinge_ids: tuple[int, ...] = ()
+    joint_vel_hinge_thr: float = 12.0
+    # DEVIATION from the paper when w_yaw_rate_hinge != 0 (default off): -|w| * max(0, |w_z| - thr)^2 with w_z the
+    # pelvis body-frame z angular velocity [rad/s], aimed at the yaw spins that saturate the real gyro (500 deg/s).
+    w_yaw_rate_hinge: float = 0.0
+    yaw_rate_hinge_thr: float = 7.5
 
     @property
     def max_step_reward(self) -> float:
@@ -93,6 +102,11 @@ def tilt_error_angle(robot_root_quat_w: torch.Tensor, ref_root_quat_w: torch.Ten
     return torch.atan2(cross, (gr * gm).sum(-1))
 
 
+def yaw_rate_hinge_value(root_ang_vel_b: torch.Tensor, thr: float) -> torch.Tensor:
+    """max(0, |w_z| - thr)^2 of the pelvis body-frame angular velocity (…, 3)."""
+    return (root_ang_vel_b[..., 2].abs() - thr).clamp(min=0.0) ** 2
+
+
 def tracking_reward_terms(
     *,
     robot_body_pos_w: torch.Tensor,
@@ -113,6 +127,7 @@ def tracking_reward_terms(
     ref_root_quat_w: torch.Tensor | None = None,
     pd: dict[str, torch.Tensor] | None = None,  # kp, kd, effort, scale, q0, jw: (29,) each
     joint_vel: torch.Tensor | None = None,
+    root_ang_vel_b: torch.Tensor | None = None,  # (N, 3) pelvis angular velocity, body frame
 ) -> dict[str, torch.Tensor]:
     """Per-term weighted, dt-scaled rewards (N,) plus 'total'."""
     ra_pos = robot_body_pos_w[..., anchor_index, :]
@@ -146,6 +161,15 @@ def tracking_reward_terms(
         joint_torque = (pd["jw"] * (tau / pd["effort"]) ** 2).sum(-1)
     else:
         joint_torque = torch.zeros_like(action_rate)
+    if cfg.w_joint_vel_hinge != 0.0 and cfg.joint_vel_hinge_ids and joint_vel is not None:
+        dq = joint_vel[..., list(cfg.joint_vel_hinge_ids)]
+        joint_vel_hinge = ((dq.abs() - cfg.joint_vel_hinge_thr).clamp(min=0.0) ** 2).sum(-1)
+    else:
+        joint_vel_hinge = torch.zeros_like(action_rate)
+    if cfg.w_yaw_rate_hinge != 0.0 and root_ang_vel_b is not None:
+        yaw_rate_hinge = yaw_rate_hinge_value(root_ang_vel_b, cfg.yaw_rate_hinge_thr)
+    else:
+        yaw_rate_hinge = torch.zeros_like(action_rate)
 
     dt = cfg.dt
     terms = {
@@ -160,6 +184,8 @@ def tracking_reward_terms(
         "locked_action_l2": dt * cfg.w_locked_action * locked_action,
         "tilt_hinge": dt * cfg.w_tilt_hinge * tilt_hinge,
         "joint_torque": dt * cfg.w_joint_torque * joint_torque,
+        "joint_vel_hinge": dt * cfg.w_joint_vel_hinge * joint_vel_hinge,
+        "yaw_rate_hinge": -dt * abs(cfg.w_yaw_rate_hinge) * yaw_rate_hinge,
     }
     total = terms["motion_global_root_pos"]
     for k, v in terms.items():
@@ -179,6 +205,12 @@ def tilt_hinge(env, command_name: str, knee: float) -> torch.Tensor:
     """max(0, tilt_err - knee) on the simulator (env-side twin of ``tracking_reward_terms``' tilt_hinge)."""
     cmd = env.command_manager.get_term(command_name)
     return (tilt_error_angle(cmd.robot_root_quat_w, cmd.root_quat_w) - knee).clamp(min=0.0)
+
+
+def yaw_rate_hinge(env, thr: float) -> torch.Tensor:
+    """max(0, |pelvis body-z angular velocity| - thr)^2 on the simulator (env-side twin of ``tracking_reward_terms``'
+    yaw_rate_hinge; register with a negative weight)."""
+    return yaw_rate_hinge_value(env.scene["robot"].data.root_link_ang_vel_b, thr)
 
 
 def joint_torque_constants(jw: tuple[tuple[str, float], ...], jw_default: float, device) -> dict[str, torch.Tensor]:

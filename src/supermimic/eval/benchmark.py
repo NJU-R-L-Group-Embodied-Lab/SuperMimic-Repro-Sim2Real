@@ -60,9 +60,12 @@ def _tilt_deg(cmd) -> torch.Tensor:
 
 @torch.no_grad()
 def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False,
-                  lock_waist: bool = False, lock_waist_refs: str = "feasible", locked_action_weight: float = 0.0) -> list[ClipResult]:
+                  lock_waist: bool = False, lock_waist_refs: str = "feasible", locked_action_weight: float = 0.0,
+                  waist_coupling: tuple[float, float] | None = None, waist_roll_range: float | None = None) -> list[ClipResult]:
     """locked_action_weight defaults to 0 so that the benchmark reward is the same as the unlocked one (the term is
-    a training-only regulariser); pass the training value to include it."""
+    a training-only regulariser); pass the training value to include it. waist_coupling = (k, c): evaluate on the robot
+    with the real-G1 waist roll/pitch coupling (supermimic.deploy.waist_coupling); None = uncoupled (default).
+    waist_roll_range: waist_roll_joint range +-r (supermimic.deploy.waist_roll); None = MJCF +-0.52 (default)."""
     num_envs = min(num_envs or 1024, len(npz_files))
     args = SuperMimicEnvCfgArgs(
         npz_files=npz_files,
@@ -80,6 +83,8 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         lock_waist=lock_waist,
         lock_waist_refs=lock_waist_refs,
         locked_action_weight=locked_action_weight,
+        **({} if waist_coupling is None else {"waist_coupling": True, "waist_coupling_k": waist_coupling[0], "waist_coupling_c": waist_coupling[1]}),
+        **({} if waist_roll_range is None else {"waist_roll_range": waist_roll_range}),
     )
     env = make_env(args, device=device)
     try:

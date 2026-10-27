@@ -7,7 +7,7 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
   * multi-clip command with return-based reset sampling and clip-end time-outs;
   * rewards: self-collision term removed, joint-limit weight -2;
   * terminations: pelvis height / tilt vs reference, no end-effector term, clip-end time-out;
-  * events: no push; friction and encoder bias re-sampled per episode; COM at startup;
+  * events: no push (opt-in pelvis push window / knee effort scale: mdp/events.py); friction and encoder bias re-sampled per episode; COM at startup;
   * a ``ReplayRecorder`` streams transitions into a GPU replay buffer;
   * ``lock_waist``: waist-locked G1 (waist roll/pitch deleted from the model, ``supermimic.envs.lock_waist``) with
     the unchanged 29-d action / observation interface, optionally with feasible (waist roll/pitch = 0) references.
@@ -35,6 +35,7 @@ from mjlab.viewer import ViewerConfig
 
 from supermimic.data.recorder import ReplayRecorderCfg
 from supermimic.envs.actions import NoisyJointPositionActionCfg
+from supermimic.envs.mdp import events as sm_ev
 from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import rewards as sm_rew
 from supermimic.envs.mdp import terminations as sm_term
@@ -89,9 +90,28 @@ class SuperMimicEnvCfgArgs:
     root_tilt_threshold: float = 0.8
     tilt_hinge_weight: float = 0.0  # DEVIATION when != 0: reward weight of max(0, tilt_err - knee) (mdp/rewards.py)
     tilt_hinge_knee: float = 0.21
+    # DEVIATION when != 0: weight of -|w| max(0, |pelvis body-z ang vel| - thr)^2 (mdp/rewards.py yaw_rate_hinge)
+    yaw_rate_hinge_weight: float = 0.0
+    yaw_rate_hinge_thr: float = 7.5
+    # DEVIATION when > 0: saturating-IMU observation model for base_ang_vel / projected_gravity (envs/imu_model.py)
+    imu_sat_prob: float = 0.0
+    imu_gyro_limit: float = 8.727
+    imu_accel_k_max: float = 0.5
     # DEVIATION when set (default off): per-reset PD stiffness scale and extra torso mass [kg] (sim2sim G2 robustness axes)
     dr_kp_range: tuple[float, float] | None = None
     dr_torso_mass_add: tuple[float, float] | None = None
+    dr_action_delay_substeps: int = 0  # DEVIATION when > 0: per-episode command latency 0..N physics substeps (envs/actions.py)
+    # DEVIATION when set (default off): per-reset effort-limit (actuator force range) scale of the knee joints
+    dr_knee_effort_scale: tuple[float, float] | None = None
+    # DEVIATION when dr_push_prob > 0 (default off): per-episode pelvis force/torque inside a clip-frame window
+    # (mdp/events.py PelvisPushWindow). frames: clip-local frame range of the push start; steps: duration range in
+    # policy steps; force/torque: per-axis world-frame max [N] / [Nm]; clips: clip-name substrings (empty = all clips).
+    dr_push_prob: float = 0.0
+    dr_push_frames: tuple[int, int] = (690, 730)
+    dr_push_steps: tuple[int, int] = (2, 10)
+    dr_push_force: tuple[float, float, float] = (60.0, 60.0, 30.0)
+    dr_push_torque: tuple[float, float, float] = (8.0, 8.0, 8.0)
+    dr_push_clips: tuple[str, ...] = ()
     joint_limit_weight: float = -2.0
     bin_frames: int = 50
     compact_library: bool = False
@@ -103,6 +123,19 @@ class SuperMimicEnvCfgArgs:
     lock_waist: bool = False
     lock_waist_refs: str = "feasible"
     locked_action_weight: float = -0.1  # weight of sum(a_13^2 + a_14^2) when lock_waist (0 disables the term)
+    # DEVIATION when True (default off): real-G1 waist roll/pitch coupling |roll| + k |pitch| <= c as two limited fixed
+    # tendons in the robot MJCF (supermimic.deploy.waist_coupling); joint ranges unchanged.
+    waist_coupling: bool = False
+    waist_coupling_k: float = 1.4
+    waist_coupling_c: float = 0.95
+    # DEVIATION when set (default off): waist_roll_joint range +-waist_roll_range in the robot MJCF (real G1 reaches 0.70;
+    # supermimic.deploy.waist_roll). Soft limits (joint-limit reward, reset clamp) stay nominal unless
+    # waist_roll_model_soft_limits.
+    waist_roll_range: float | None = None
+    waist_roll_model_soft_limits: bool = False
+    # DEVIATION when set (default off, domain_randomization only): per-reset waist-roll dof_damping / frictionloss (abs)
+    dr_waist_roll_damping: tuple[float, float] | None = None
+    dr_waist_roll_friction: tuple[float, float] | None = None
     extra_command_kwargs: dict = field(default_factory=dict)
 
 
@@ -126,10 +159,18 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             "joint_vel": ObservationTermCfg(func=base_mdp.joint_vel_rel, noise=noise(-0.5, 0.5)),
         }
         locked_ids = ()
+    if a.imu_sat_prob > 0.0:
+        from supermimic.envs.imu_model import ImuBaseAngVel, ImuProjectedGravity
+
+        imu_params = {"prob": a.imu_sat_prob, "gyro_limit": a.imu_gyro_limit, "accel_k_max": a.imu_accel_k_max}
+        ang_vel_func, gravity_func = ImuBaseAngVel, ImuProjectedGravity
+    else:
+        imu_params = {}
+        ang_vel_func, gravity_func = base_mdp.base_ang_vel, base_mdp.projected_gravity
     policy_terms = {
         **joint_obs,
-        "base_ang_vel": ObservationTermCfg(func=base_mdp.base_ang_vel, noise=noise(-0.2, 0.2)),
-        "projected_gravity": ObservationTermCfg(func=base_mdp.projected_gravity, noise=noise(-0.05, 0.05)),
+        "base_ang_vel": ObservationTermCfg(func=ang_vel_func, params=dict(imu_params), noise=noise(-0.2, 0.2)),
+        "projected_gravity": ObservationTermCfg(func=gravity_func, params=dict(imu_params), noise=noise(-0.05, 0.05)),
         "actions": ObservationTermCfg(func=base_mdp.last_action),
     }
     observations = {
@@ -166,6 +207,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             use_default_offset=True,
             noise_std=a.action_noise_std,
             locked_joint_ids=locked_ids,
+            delay_substeps_max=a.dr_action_delay_substeps if a.domain_randomization else 0,
         )
     }
 
@@ -232,6 +274,35 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
                 func=dr.body_mass,
                 params={"asset_cfg": SceneEntityCfg("robot", body_names=("torso_link",)), "operation": "add", "ranges": tuple(a.dr_torso_mass_add)},
             )
+        # Waist-roll joint damping / friction (dof fields of waist_roll_joint only; nominal 0 in the training MJCF).
+        if a.dr_waist_roll_damping is not None:
+            events["waist_roll_damping"] = EventTermCfg(
+                mode="reset",
+                func=dr.joint_damping,
+                params={"asset_cfg": SceneEntityCfg("robot", joint_names=("waist_roll_joint",)), "operation": "abs", "ranges": tuple(a.dr_waist_roll_damping)},
+            )
+        if a.dr_waist_roll_friction is not None:
+            events["waist_roll_friction"] = EventTermCfg(
+                mode="reset",
+                func=dr.joint_friction,
+                params={"asset_cfg": SceneEntityCfg("robot", joint_names=("waist_roll_joint",)), "operation": "abs", "ranges": tuple(a.dr_waist_roll_friction)},
+            )
+        if a.dr_knee_effort_scale is not None:
+            events["knee_effort"] = EventTermCfg(
+                mode="reset",
+                func=sm_ev.joint_effort_limit_scale,
+                params={"joint_names": ("left_knee_joint", "right_knee_joint"), "scale_range": tuple(a.dr_knee_effort_scale)},
+            )
+        if a.dr_push_prob > 0.0:
+            events["pelvis_push"] = EventTermCfg(
+                mode="step",
+                func=sm_ev.PelvisPushWindow,
+                params={
+                    "prob": a.dr_push_prob, "frames": tuple(a.dr_push_frames), "steps": tuple(a.dr_push_steps),
+                    "force_max": tuple(a.dr_push_force), "torque_max": tuple(a.dr_push_torque),
+                    "clip_names": tuple(a.dr_push_clips), "body_name": ROOT_BODY, "command_name": "motion",
+                },
+            )
     else:
         # Evaluation protocol: foot friction fixed at 1.0, no other randomization.
         events["foot_friction"] = EventTermCfg(
@@ -258,6 +329,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     }
     if a.tilt_hinge_weight != 0.0:
         rewards["tilt_hinge"] = RewardTermCfg(func=sm_rew.tilt_hinge, weight=a.tilt_hinge_weight, params={"command_name": "motion", "knee": a.tilt_hinge_knee})
+    if a.yaw_rate_hinge_weight != 0.0:
+        rewards["yaw_rate_hinge"] = RewardTermCfg(func=sm_rew.yaw_rate_hinge, weight=-abs(a.yaw_rate_hinge_weight), params={"thr": a.yaw_rate_hinge_thr})
     if a.lock_waist and a.locked_action_weight != 0.0:
         rewards["locked_action_l2"] = RewardTermCfg(func=sm_rew.locked_action_l2, weight=a.locked_action_weight, params={"action_ids": locked_ids})
 
@@ -274,7 +347,7 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
 
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": robot_cfg(a.lock_waist)}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": robot_cfg(a.lock_waist, (a.waist_coupling_k, a.waist_coupling_c) if a.waist_coupling else None, a.waist_roll_range)}),
         observations=observations,
         actions=actions,
         commands=commands,
@@ -291,16 +364,51 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     return cfg
 
 
-def robot_cfg(lock_waist: bool = False):
+def robot_cfg(lock_waist: bool = False, waist_coupling: tuple[float, float] | None = None, waist_roll_range: float | None = None):
+    """G1 entity cfg. waist_coupling = (k, c): add the real-robot waist roll/pitch coupling tendons (opt-in).
+    waist_roll_range: waist_roll_joint range +-waist_roll_range instead of the MJCF +-0.52 (opt-in)."""
     if lock_waist:
+        if waist_coupling is not None:
+            raise ValueError("--env.waist-coupling needs the unlocked waist (not --env.lock-waist)")
+        if waist_roll_range is not None:
+            raise ValueError("--env.waist-roll-range needs the unlocked waist (not --env.lock-waist)")
         from supermimic.envs.lock_waist import get_g1_lock_waist_robot_cfg
 
         return get_g1_lock_waist_robot_cfg()
-    return get_g1_robot_cfg()
+    cfg = get_g1_robot_cfg()
+    if waist_coupling is not None:
+        from supermimic.deploy.waist_coupling import add_waist_coupling
+
+        base_spec_fn, (k, c) = cfg.spec_fn, waist_coupling
+        cfg.spec_fn = lambda: add_waist_coupling(base_spec_fn(), k, c)
+    if waist_roll_range is not None:
+        from supermimic.deploy.waist_roll import set_waist_roll_range
+
+        spec_fn_wr, r = cfg.spec_fn, float(waist_roll_range)
+        cfg.spec_fn = lambda: set_waist_roll_range(spec_fn_wr(), r)
+    return cfg
+
+
+def keep_nominal_waist_roll_soft_limits(env: ManagerBasedRlEnv) -> None:
+    """With a widened waist-roll range: reset the entity's waist-roll soft limits (joint-limit reward, reset clamp,
+    imagined reward via full_joint_constants) to the nominal MJCF range (+-0.52 x soft factor)."""
+    from supermimic.deploy.waist_roll import NOMINAL_RANGE, ROLL
+
+    robot = env.scene["robot"]
+    names = [n.split("/")[-1] for n in robot.joint_names]
+    j = names.index(ROLL)
+    f = float(robot.cfg.articulation.soft_joint_pos_limit_factor)
+    robot.data.soft_joint_pos_limits[:, j, 0] = -f * NOMINAL_RANGE
+    robot.data.soft_joint_pos_limits[:, j, 1] = f * NOMINAL_RANGE
 
 
 def make_env(a: SuperMimicEnvCfgArgs, device: str = "cuda:0") -> ManagerBasedRlEnv:
     from mjlab.utils.torch import configure_torch_backends
 
     configure_torch_backends()
-    return ManagerBasedRlEnv(make_env_cfg(a), device=device)
+    if a.lock_waist and (a.waist_roll_range is not None or a.dr_waist_roll_damping is not None or a.dr_waist_roll_friction is not None):
+        raise ValueError("waist_roll_range / dr_waist_roll_* need the unlocked waist (not lock_waist)")
+    env = ManagerBasedRlEnv(make_env_cfg(a), device=device)
+    if a.waist_roll_range is not None and not a.waist_roll_model_soft_limits:
+        keep_nominal_waist_roll_soft_limits(env)
+    return env

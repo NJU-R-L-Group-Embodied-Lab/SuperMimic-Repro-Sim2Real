@@ -8,6 +8,8 @@
 
 <p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.0/shanshenbu_real_robot_v3.mp4"><img src="docs/assets/shanshenbu_demo.gif" alt="G1 真机跳闪身步：左边是人类原视频，右边是机器人" width="720"></a><br><sub>左：人类原视频；右：G1 真机。点击看带声音的完整视频（约 46 秒）。</sub></p>
 
+<p align="center"><a href="https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases/download/v1.1/shanshenbu_pro_real_robot.mp4"><img src="docs/assets/shanshenbu_pro_demo.gif" alt="G1 真机跳闪身步 Pro：左边是人类原视频，右边是机器人" width="480"></a><br><sub>闪身步 Pro（v1.1，模型 <code>e24_0355000</code>）：带两次快速转体和单脚落地的跳跃。左：人类原视频；右：G1 真机。点击看带声音的视频（约 15 秒）。详见 <a href="docs/REAL_ROBOT_LEAN35KFS.md">docs/REAL_ROBOT_LEAN35KFS.md</a>。</sub></p>
+
 实机演示视频和预训练模型在 [GitHub Release](https://github.com/NJU-R-L-Group-Embodied-Lab/SuperMimic-Repro-Sim2Real/releases)。
 
 > **安全警告**：真机代码会直接控制 G1 的电机。模型、参数或操作出错，机器人可能摔倒、损坏或伤人。请只在吊架保护下运行，并且始终有人拿着遥控器，随时准备按 L2+B 让机器人进入阻尼（软急停）。上机前完整读一遍 [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md)。本项目按原样提供，使用风险自负。
@@ -30,6 +32,7 @@
 
 - 严格按论文设置，LAFAN1 得分明显低于论文。加上这个位置输入就能追上，但真机测不到自己在房间里的位置，所以这种模型上不了真机。
 - 真机：G1 完整跳完了 4 段舞蹈连起来的约 46 秒动作，身体倾斜和参考动作最多差 16.3°（超过 20° 程序会自动停止）。
+- v1.1 新增（2026-10）：G1 连续两次从头到尾跳完了约 22 秒的 `shanshen_duosuomao_lean35kfs_pad2`。这段舞有两次快速转体和一次单脚落地的跳跃，用的模型是 `e24_0355000`，两次都挂着保护绳，但绳是松的。这只是同一个模型跑了两次，也没有做消融实验。在它之前，9 个模型在这段舞上的真机尝试全部失败。失败原因、我们改了什么、哪些仿真测试能预测真机结果，见 [docs/REAL_ROBOT_LEAN35KFS.md](docs/REAL_ROBOT_LEAN35KFS.md)（英文）。
 - 详细数字和原因见 [docs/METHOD.md](docs/METHOD.md#results)。
 
 ## 快速开始
@@ -107,6 +110,7 @@ python scripts/deploy/bridge/g1_runner_bridge.py --iface <nic> --domain 0 --stag
 | [docs/VIDEO_TO_MOTION.md](docs/VIDEO_TO_MOTION.md) | 怎么从一段跳舞视频里提取出机器人能做的动作 |
 | [docs/SIM2SIM.md](docs/SIM2SIM.md) | 怎么导出模型，以及上真机前在仿真里要过哪些测试 |
 | [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) | 真机操作手册：安全措施、遥控器按键、上机步骤、出问题怎么办 |
+| [docs/REAL_ROBOT_LEAN35KFS.md](docs/REAL_ROBOT_LEAN35KFS.md) | 转体加落地的舞蹈怎么在真机上跑通（`e24_0355000`）：失败原因、训练命令、仿真测试、上机命令 |
 | [docs/REFERENCES.md](docs/REFERENCES.md) | 所有引用的 BibTeX |
 
 ## 预训练模型
@@ -115,6 +119,7 @@ python scripts/deploy/bridge/g1_runner_bridge.py --iface <nic> --domain 0 --stag
 
 - `e11c_0220000`：在 BONES-SEED 上训练的基础模型。
 - `e13i_0291000`：在基础模型上继续训练，训练数据是 BONES-SEED 加 4 段自定义舞蹈（不是只有这 4 段），Release 里有它在真机上跳舞的视频。
+- `e24_0355000`（v1.1，文件 `e24_0355000_lean35kfs.tar.gz`）：只在 `shanshen_duosuomao_lean35kfs_pad2` 这一段舞上微调出来的模型。它不是通用的动作跟踪模型，只能配这段动作用。压缩包里还有这段动作（训练用的 npz 和部署用的目标表）、只含这一段的训练数据包和真机状态重置文件，要在仓库根目录解压。训练命令见 [scripts/train/train_lean35kfs_e24.sh](scripts/train/train_lean35kfs_e24.sh)（它的父模型没有发布），仿真测试见 [scripts/train/gate_lean35kfs.sh](scripts/train/gate_lean35kfs.sh)。它用到的新训练选项默认全部关闭，包括：腰部耦合和腰部 roll 范围，指令延迟、推力和腰部 roll 的随机化，会饱和的 IMU 观测，膝速度和偏航角速度惩罚，以及真机状态重置。说明见 [docs/METHOD.md](docs/METHOD.md#options-that-deviate-from-the-paper-and-known-differences)。
 
 用法：解压到 `deploy_artifacts/`，然后按 [docs/SIM2SIM.md](docs/SIM2SIM.md) 重新跑一遍仿真测试，再按 [docs/DEPLOY_G1.md](docs/DEPLOY_G1.md) 上机。脚本默认用的是没发布的旧模型，所以要手动加 `--ckpt e13i_0291000`（仿真测试）或 `--artifacts deploy_artifacts/e13i_0291000`（真机程序）。两个模型都用 BONES-SEED 训练，使用前请确认它的数据条款。
 
@@ -123,7 +128,10 @@ Release 里没有动作目标表 `deploy_artifacts/clips/<clip>.npz`，要按 [d
 ```bash
 mkdir -p deploy_artifacts
 tar -xzf /path/to/e13i_0291000.tar.gz -C deploy_artifacts/   # -> deploy_artifacts/e13i_0291000/
+tar -xzf /path/to/e24_0355000_lean35kfs.tar.gz -C .            # v1.1，在仓库根目录解压：deploy_artifacts/e24_0355000/、deploy_artifacts/clips/、data/...
 ```
+
+v1.1 包里的 `policy.onnx` 已经是 ONNX IR 9，可以直接在 PC2 上用；`policy_ir10.onnx` 是原始导出的版本。`e24_0355000` 的 Release 已经带了动作目标表 `deploy_artifacts/clips/shanshen_duosuomao_lean35kfs_pad2.npz`。
 
 ## 许可证
 

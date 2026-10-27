@@ -93,6 +93,38 @@ python scripts/deploy/sim2sim.py --cmd all --ckpt <name> --workers 10
 - **Numerical parity**: `tests/test_deploy_parity.py` (needs CUDA, the BONES-SEED npz, onnxruntime, and the exported `deploy_artifacts/<ckpt>/policy.onnx` and `deploy_artifacts/ckpts/<ckpt>.pt`); select the model with `SM_PARITY_CKPT=<name>` (default `ckpt_0116000`; skipped if it does not exist). It uses an explicit no-safety configuration and covers 4 clips × 200 steps, with tolerances of 1e-4 for obs/goal, 1e-3 for action (core ONNX vs. torch fp32), 1e-5 for q_target, and goal-row misalignment must be 0. This test does **not** cover the default clamping; clamping is checked by the G1 gate.
 - **End-to-end DDS tests**: `bash scripts/deploy/bridge/run_sim_e2e_bridge.sh <test>` tests the bridge runner (run `bridge/build.sh` first), and `bash scripts/deploy/run_sim_e2e.sh <test>` tests the pure-Python runner. Environment variables are `CKPT`, `CLIPS`, `STAGE` (default ground), `LOCK=1`, `LW_DIRECT`, `SIM_DT`, `E2E_NAME`, `G1_DEPLOY_HOME`. For the test list and results, see "Simulated end-to-end tests (DDS)" in [Real-robot deployment](DEPLOY_G1.md).
 
+## Real-G1 models and extra checks (opt-in)
+
+These options were added while bringing the spin / landing dance `shanshen_duosuomao_lean35kfs_pad2` to the real robot (see [Real-robot result: lean35kfs](REAL_ROBOT_LEAN35KFS.md)). All of them are off by default, so the gates above are unchanged. The settings are inherited by the worker processes, and each one adds a suffix to the report names (`_wc`, `_wr`, `_imu`, in this order: `sim2sim_<tag>_wc_wr_imu_<ckpt>.json`), so these results never overwrite the plain ones.
+
+| Option (`sim2sim.py`) | Environment variable | What it models |
+|---|---|---|
+| `--imu-model` | `SM_IMU_MODEL=1` | Real pelvis IMU: gyro clipped at ±500°/s per axis, orientation integrated from the clipped gyro with no accelerometer correction (`src/supermimic/deploy/imu_model.py`). G2 rows then carry `imu_sat_z_frames`, `imu_grav_err_max_deg` (+ `_frame`) and `imu_rot_lost_z_rad` |
+| `--waist-coupling` (`--waist-coupling-k 1.4 --waist-coupling-c 0.95`) | `SM_WAIST_COUPLING=k,c` (or `1` for the defaults) | Waist roll/pitch linkage \|roll\| + k \|pitch\| ≤ c as two limited tendons in every gate model (`src/supermimic/deploy/waist_coupling.py`; k, c fitted on real logs) |
+| `--waist-roll-range R --waist-roll-damping D --waist-roll-friction F` | `SM_WAIST_ROLL="range=0.72,damping=1.8,friction=2"` | Waist roll range ±R instead of ±0.52 in every model; extra waist-roll damping D [Nm·s/rad] and frictionloss F [Nm] in the Unitree models only (`src/supermimic/deploy/waist_roll.py`) |
+| `--vel-check-1khz` | `SM_VEL_CHECK_1KHZ=1` | G2 also aborts when any 1 kHz physics sample exceeds the joint-speed threshold (the real runner checks one sample per 50 Hz step). The 1 kHz peaks (`knee_peak_1khz`, `peak_joint_1khz`, `dq_peak_1khz`, `vel_over_1khz_ms`) are recorded in either case |
+
+- The G1 gate compares against the training environment, so its reference rollout must use the same physics. `sim2sim_ref.py` takes the waist coupling and the waist roll range from the checkpoint (what it was trained with), or from `SM_WAIST_COUPLING` / `SM_WAIST_ROLL` when they are set.
+- `--waist-coupling`, `--waist-roll-*` and `--imu-model` cannot be combined with `--lock-waist` or `--cmd lw`.
+- Example (the setting used to choose `e24_0355000`):
+
+  ```bash
+  python scripts/deploy/sim2sim.py --cmd g2,g3,report --clips shanshen_duosuomao_lean35kfs_pad2 --tag lean35kfs --ckpt e24_0355000 \
+      --imu-model --waist-coupling --waist-roll-range 0.72 --waist-roll-damping 1.8 --workers 16
+  ```
+
+  `scripts/train/gate_lean35kfs.sh` runs this, plus export, standby and a summary.
+
+**Real-state gate** (`scripts/deploy/realstate_gate.py`). It starts the Unitree-model simulation from *real* logged robot states (joint q/dq, IMU orientation, gyro, the policy's observation history) at given clip frames of your own real runs. From there it runs the deploy core over a latency × kp × mass × friction × velocity-estimate grid. The IMU model and the waist coupling are on by default; `--waist-roll-range R` (or `SM_WAIST_ROLL_RANGE=R`) widens the waist roll for this gate. It prints one `RS` line, with PASS = 0 knee joint-speed aborts and p95 of the 1 kHz knee peak ≤ 13 rad/s, and writes `deploy_artifacts/reports/realstate_<tag>.json`.
+
+```bash
+python scripts/deploy/realstate_gate.py --artifacts deploy_artifacts/<ckpt> \
+    --clip deploy_artifacts/clips/shanshen_duosuomao_lean35kfs_pad2.npz \
+    --real-logs deploy_logs/real/<run_a> deploy_logs/real/<run_b> --waist-roll-range 0.72 --workers 16
+```
+
+On this clip, only the knee-abort count of this gate ranked checkpoints in the same order as the real robot did. Its other numbers start from the failure states of *other* policies and were misleading; see [Which sim gates predicted the real result](REAL_ROBOT_LEAN35KFS.md#which-sim-gates-predicted-the-real-result).
+
 ## Representative results (early e11 policies, round 2 core defaults)
 
 **Summary**:

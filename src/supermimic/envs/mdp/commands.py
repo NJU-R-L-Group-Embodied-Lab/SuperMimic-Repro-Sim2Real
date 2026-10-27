@@ -40,6 +40,18 @@ n_b = VISITS_SATURATED, i.e. alpha_b = ema_alpha exactly as in the run that wrot
 Deviations from the paper (all default OFF): ``hard_clip_cap`` (no clip may take more than this fraction of the
 hard softmax share) and ``fail_reset_frac`` / ``fail_reset_list`` (a fraction of resets placed shortly before known
 benchmark failure frames).
+
+Real-log resets (deviation from the paper, default off): ``real_reset_prob`` of the training resets (never forced /
+evaluation resets) start from a state measured on the real robot (``real_reset_file``, written by
+scripts/data/build_real_reset_states.py): measured joint q/dq, IMU orientation re-aligned to the clip heading, gyro,
+stance foot on the floor, root linear velocity from the clip or from the stance-foot-zero-velocity estimate
+(``real_reset_vel``), with the motion command set to that state's clip frame and small per-reset perturbations (height,
+vertical velocity, roll/pitch, joint q/dq). Joint positions are clipped to the model's hard joint range (not the soft
+limits used for reference resets), so a measured waist-roll overshoot survives a widened ``--env.waist-roll-range``.
+Everything else about the reset is that of any other reset: the policy
+observation history is refilled from the first post-reset observation, last action = 0, the action-delay and IMU
+models start fresh. These episodes do not update the return-based sampler statistics (their returns describe the real
+start state, not the reference one).
 """
 
 from __future__ import annotations
@@ -102,6 +114,30 @@ def cap_per_clip(hard: torch.Tensor, bin_clip: torch.Tensor, num_clips: int, cap
             scale[~capped] = (1.0 - cap * capped.sum()) / free_mass
         p = p * scale[bin_clip]
     return p
+
+
+def load_real_reset_states(path: str | Path, lib: MotionLibrary, device) -> dict[str, torch.Tensor]:
+    """Real-log reset states (scripts/data/build_real_reset_states.py npz) as device tensors; ``frame`` is the global
+    library frame of each state (clip start + ref_frame), root_pos is relative to the env origin."""
+    import numpy as np
+
+    with np.load(path) as z:
+        d = {k: z[k] for k in z.files}
+    clip = str(d["clip"])
+    names = [c.name for c in lib.clips]
+    if clip not in names:
+        raise ValueError(f"real-reset file {path}: clip {clip!r} is not in the motion library")
+    ci = names.index(clip)
+    rf = torch.as_tensor(d["ref_frame"].astype(np.int64), device=device)
+    length = int(lib.clip_len[ci])
+    if int(rf.min()) < 0 or int(rf.max()) > length - 3:
+        raise ValueError(f"real-reset file {path}: ref frames {int(rf.min())}..{int(rf.max())} outside clip {clip} (len {length})")
+    t = lambda k: torch.as_tensor(d[k], dtype=torch.float32, device=device)  # noqa: E731
+    out = {k: t(k) for k in ("joint_pos", "joint_vel", "root_pos", "root_quat", "root_ang_vel_b", "root_lin_vel_clip", "root_lin_vel_foot")}
+    out["frame"] = lib.clip_start[ci] + rf
+    out["source"] = torch.as_tensor(d["source"].astype(np.int64), device=device)
+    assert out["joint_pos"].shape[1] == 29 and out["root_quat"].shape[1] == 4, (out["joint_pos"].shape, out["root_quat"].shape)
+    return out
 
 
 def load_fail_points(path: str | Path) -> list[tuple[str, int]]:
@@ -196,6 +232,16 @@ class MultiClipMotionCommand(CommandTerm):
             raise ValueError(f"fail_reset_frac = {cfg.fail_reset_frac} > 0 needs fail_reset_list (--env.fail-reset-list)")
         if cfg.fail_reset_list:
             self.set_fail_points(load_fail_points(cfg.fail_reset_list))
+        # Real-log resets (deviation from the paper, default off; module docstring).
+        self.real_states: dict[str, torch.Tensor] | None = None
+        self.real_ep = torch.zeros(n, dtype=torch.bool, device=self.device)  # episode started from a real-log state
+        if cfg.real_reset_prob > 0 and not cfg.real_reset_file:
+            raise ValueError(f"real_reset_prob = {cfg.real_reset_prob} > 0 needs real_reset_file (--env.real-reset-file)")
+        assert cfg.real_reset_vel in ("clip", "foot", "mix"), cfg.real_reset_vel
+        if cfg.real_reset_file:
+            self.real_states = load_real_reset_states(cfg.real_reset_file, lib, self.device)
+            print(f"[INFO] real-log resets (deviation from paper): {self.real_states['frame'].shape[0]} states from "
+                  f"{cfg.real_reset_file}, prob {cfg.real_reset_prob}, root velocity {cfg.real_reset_vel}")
 
     # ------------------------------------------------------------------ reference (mjlab MotionCommand API)
 
@@ -496,11 +542,43 @@ class MultiClipMotionCommand(CommandTerm):
         self.metrics["sampling_entropy"][:] = ent
         return f
 
-    def _write_reference_state_to_sim(self, env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel):
+    def sample_real_states(self, n: int, idx: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        """n perturbed real-log reset states (origin-free root position, world-frame velocities): height +U(dz),
+        vertical velocity +U(-dvz, dvz), roll / pitch (world axes) U(-tilt, tilt) deg, joint q / dq + U(-jp, jp) /
+        U(-jv, jv). The body angular velocity (gyro) is kept in the body frame of the perturbed orientation."""
+        cfg, rs, dev = self.cfg, self.real_states, self.device
+        j = torch.randint(0, rs["frame"].shape[0], (n,), device=dev) if idx is None else idx
+        if cfg.real_reset_vel == "clip":
+            foot = torch.zeros(n, dtype=torch.bool, device=dev)
+        elif cfg.real_reset_vel == "foot":
+            foot = torch.ones(n, dtype=torch.bool, device=dev)
+        else:
+            foot = torch.rand(n, device=dev) < 0.5
+        lin = torch.where(foot[:, None], rs["root_lin_vel_foot"][j], rs["root_lin_vel_clip"][j])
+        pos = rs["root_pos"][j].clone()
+        pos[:, 2] += sample_uniform(cfg.real_reset_dz[0], cfg.real_reset_dz[1], (n,), device=dev)
+        lin = lin.clone()
+        lin[:, 2] += sample_uniform(-cfg.real_reset_dvz, cfg.real_reset_dvz, (n,), device=dev)
+        t = math.radians(cfg.real_reset_tilt_deg)
+        rp = sample_uniform(-t, t, (n, 2), device=dev)
+        quat = quat_mul(quat_from_euler_xyz(rp[:, 0], rp[:, 1], torch.zeros_like(rp[:, 0])), rs["root_quat"][j])
+        ang_w = quat_apply(quat, rs["root_ang_vel_b"][j])
+        jp, jv = cfg.real_reset_joint_pos_noise, cfg.real_reset_joint_vel_noise
+        q = rs["joint_pos"][j] + sample_uniform(-jp, jp, (n, 29), device=dev)
+        dq = rs["joint_vel"][j] + sample_uniform(-jv, jv, (n, 29), device=dev)
+        return {"frame": rs["frame"][j], "root_pos": pos, "root_quat": quat, "root_lin_vel": lin, "root_ang_vel": ang_w,
+                "joint_pos": q, "joint_vel": dq, "index": j, "foot_vel": foot}
+
+    def _write_reference_state_to_sim(self, env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel, hard=None):
+        """hard (bool per env_ids row, optional): clip those rows to the model's hard joint range instead of the soft
+        limits (real-log states: the measured waist roll overshoot, e.g. -0.685, must survive a widened
+        --env.waist-roll-range even though the soft limits stay nominal)."""
         if self._locked:  # the reference's locked-joint entries have nothing to be written to
             joint_pos, joint_vel = joint_pos[:, self._slots], joint_vel[:, self._slots]
-        soft_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-        joint_pos = torch.clip(joint_pos, soft_limits[:, :, 0], soft_limits[:, :, 1])
+        limits = self.robot.data.soft_joint_pos_limits[env_ids]
+        if hard is not None and bool(hard.any()):
+            limits = torch.where(hard[:, None, None], self.robot.data.joint_pos_limits[env_ids], limits)
+        joint_pos = torch.clip(joint_pos, limits[:, :, 0], limits[:, :, 1])
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
         self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
@@ -512,7 +590,8 @@ class MultiClipMotionCommand(CommandTerm):
         mask[env_ids] = True
         if self.ep_len.sum() > 0 or hasattr(self._env, "reward_buf"):
             self._log_step_rewards(mask)
-            self._finalize_episodes(env_ids)
+            # Real-log-start episodes are left out of the sampler statistics (module docstring).
+            self._finalize_episodes(env_ids[~self.real_ep[env_ids]])
         self.ep_len[env_ids] = 0
 
         sampled = self._sample_frames(len(env_ids))
@@ -540,8 +619,23 @@ class MultiClipMotionCommand(CommandTerm):
         lo, hi = self.cfg.joint_position_range
         if hi > lo:
             joint_pos = joint_pos + sample_uniform(lo, hi, joint_pos.shape, device=self.device)
+        joint_vel = joint_vel.clone()
 
-        self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel)
+        self.real_ep[env_ids] = False
+        hard = None
+        if self.real_states is not None and self.cfg.real_reset_prob > 0:
+            use = (torch.rand(len(env_ids), device=self.device) < self.cfg.real_reset_prob) & (forced < 0)
+            if use.any():
+                k = use.nonzero().squeeze(-1)
+                st = self.sample_real_states(len(k))
+                self.frame[env_ids[k]] = st["frame"]
+                self.real_ep[env_ids[k]] = True
+                root_pos[k] = st["root_pos"] + self._env.scene.env_origins[env_ids[k]]
+                root_ori[k], root_lin_vel[k], root_ang_vel[k] = st["root_quat"], st["root_lin_vel"], st["root_ang_vel"]
+                joint_pos[k], joint_vel[k] = st["joint_pos"], st["joint_vel"]
+                hard = use
+
+        self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel, hard=hard)
 
     def update_relative_body_poses(self) -> None:
         nb = len(self.cfg.body_names)
@@ -577,6 +671,7 @@ class MultiClipMotionCommand(CommandTerm):
     def reset_to_frame(self, env_ids: torch.Tensor, frame: torch.Tensor) -> None:
         """Deterministic reset to exact reference frames (no noise); used by evaluation."""
         self.ep_len[env_ids] = 0
+        self.real_ep[env_ids] = False
         self.frame[env_ids] = frame
         self.clip_end[env_ids] = False
         r = self.library.ref(frame)
@@ -649,6 +744,16 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     fail_reset_frac: float = 0.0
     fail_reset_list: str | None = None
     fail_reset_window_s: float = 3.0
+    # Deviation from the paper, 0 = off: probability that a (non-forced) reset starts from a real-log state of
+    # real_reset_file (module docstring); real_reset_vel: root linear velocity "clip" | "foot" | "mix" (50/50).
+    real_reset_prob: float = 0.0
+    real_reset_file: str | None = None
+    real_reset_vel: str = "mix"
+    real_reset_dz: tuple[float, float] = (-0.01, 0.01)  # [m]
+    real_reset_dvz: float = 0.2  # [m/s]
+    real_reset_tilt_deg: float = 3.0  # roll / pitch, each U(-x, x)
+    real_reset_joint_pos_noise: float = 0.02  # [rad]
+    real_reset_joint_vel_noise: float = 0.3  # [rad/s]
     gamma: float = 0.99
     ema_alpha: float = 0.05  # G_b EMA rate; with count_warmstart the floor alpha_min of max(alpha_min, 1/(n_b+1))
     # Count-based warm start of G_b (module docstring): first visit sets G_b to the observed return.

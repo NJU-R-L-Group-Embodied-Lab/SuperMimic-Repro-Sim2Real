@@ -5,6 +5,9 @@
 Waist-locked robot (G1 mode_machine 6): ``--lock-waist`` (default: whatever the checkpoint was trained with), with
 ``--lock-waist-refs feasible|original`` (default: the checkpoint's setting, else feasible). The reward of the
 benchmark is the unlocked one (no locked-action term) so returns stay comparable across robots.
+
+Real-G1 waist roll/pitch coupling (supermimic.deploy.waist_coupling): ``--waist-coupling`` / ``--no-waist-coupling``
+(default: SM_WAIST_COUPLING if set, else whatever the checkpoint was trained with); coupled results get a ``_wc`` suffix.
 """
 
 from __future__ import annotations
@@ -13,22 +16,28 @@ from pathlib import Path
 
 import tyro
 
+from supermimic.deploy.waist_coupling import WAIST_COUPLING_C, WAIST_COUPLING_K, resolve_coupling
+from supermimic.deploy.waist_roll import resolve_range as resolve_waist_roll_range
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint, run_benchmark, save_results, summarize
 
 
 def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] | None = None, clip_list: Path | None = None, manifest: Path | None = None, num_envs: int = 1024, device: str = "cuda:0", out: Path | None = None,
-         lock_waist: bool | None = None, lock_waist_refs: str | None = None) -> None:
+         lock_waist: bool | None = None, lock_waist_refs: str | None = None, waist_coupling: bool | None = None,
+         waist_coupling_k: float = WAIST_COUPLING_K, waist_coupling_c: float = WAIST_COUPLING_C, waist_roll_range: float | None = None) -> None:
+    """waist_roll_range: waist_roll_joint range +-r; default SM_WAIST_ROLL range, else as trained, else MJCF +-0.52."""
     if clip_list is not None:
         clips = [l.strip() for l in open(clip_list) if l.strip()]
     files = [str(f) for f in discover_npz(npz_dir, names=clips, manifest=manifest)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     lock = cfg["env"].get("lock_waist", False) if lock_waist is None else lock_waist
     refs = lock_waist_refs or cfg["env"].get("lock_waist_refs", "feasible")
+    wc = resolve_coupling(cfg["env"]) if waist_coupling is None else ((waist_coupling_k, waist_coupling_c) if waist_coupling else None)
+    wr = resolve_waist_roll_range(cfg["env"]) if waist_roll_range is None else waist_roll_range
     results = run_benchmark(policy, files, device=device, num_envs=num_envs, future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False),
-                            lock_waist=lock, lock_waist_refs=refs)
+                            lock_waist=lock, lock_waist_refs=refs, waist_coupling=wc, waist_roll_range=wr)
     s = summarize(results)
-    robot = f"locked waist, {refs} refs" if lock else "29-DoF"
+    robot = (f"locked waist, {refs} refs" if lock else "29-DoF") + ("" if wc is None else f", waist coupling k {wc[0]} c {wc[1]}") + ("" if wr is None else f", waist roll range +-{wr}")
     print(f"\n{s['clips']} clips | failed {s['failed']} | mean norm return {s['mean_norm_return']:.4f} | step-weighted {s['step_weighted_norm_return']:.4f} | "
           f"tilt mean {s.get('tilt_mean_deg', float('nan')):.2f} max p50/p95/max {s.get('tilt_max_deg_p50', float('nan')):.1f}/{s.get('tilt_max_deg_p95', float('nan')):.1f}/{s.get('tilt_max_deg_max', float('nan')):.1f} deg "
           f">20deg {s.get('clips_tilt_over_20deg', -1)} | {robot}")
@@ -39,7 +48,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
     worst = sorted(results, key=lambda r: r.norm_return)[:10]
     for r in worst:
         print(f"  {r.name:32s} ret {r.norm_return:.3f} steps {r.steps}/{r.frames} tilt max {r.tilt_max_deg:.1f} {'FAIL@' + str(r.fail_step) if r.failed else ''}")
-    out = out or ckpt.parent / f"benchmark_{ckpt.stem}{'_lw' if lock else ''}.json"
+    out = out or ckpt.parent / f"benchmark_{ckpt.stem}{'_lw' if lock else ''}{'' if wc is None else '_wc'}.json"
     save_results(results, out)
     print("saved", out)
 

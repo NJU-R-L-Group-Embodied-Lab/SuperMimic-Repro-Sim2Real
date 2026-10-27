@@ -20,6 +20,8 @@ import tyro
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
+from supermimic.deploy.waist_coupling import env_args as coupling_args, resolve_coupling
+from supermimic.deploy.waist_roll import resolve_range as resolve_waist_roll_range
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
@@ -62,6 +64,8 @@ def main(
         seed=0,
         anchor_obs=cfg["env"].get("anchor_obs", False),
         debug_vis=ghost,
+        **coupling_args(resolve_coupling(cfg["env"])),  # waist coupling: SM_WAIST_COUPLING, else as trained (default off)
+        **({} if (wr := resolve_waist_roll_range(cfg["env"])) is None else {"waist_roll_range": wr}),  # SM_WAIST_ROLL, else as trained
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))
     pol = _DictPolicy(policy)
